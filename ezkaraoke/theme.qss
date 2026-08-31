@@ -174,6 +174,20 @@ QHeaderView::section {
     font-size: 13px;
 }
 
+/* Main song table: double-size display font (14px -> 28px) */
+QTableWidget#SongTable {
+    font-size: 28px;
+}
+
+QTableWidget#SongTable::item {
+    padding: 10px 14px;
+}
+
+QTableWidget#SongTable QHeaderView::section {
+    font-size: 18px;
+    padding: 10px 12px;
+}
+
 QHeaderView::section:hover {
     background-color: #1e1e2f;
 }
@@ -221,8 +235,9 @@ QTreeWidget::branch:open:has-children:has-siblings {
 }
 
 /* ===== List Widget (artist / letter indexes) ===== */
-QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; }
-QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #141420; }
+/* Large text + 56px avatar icons: meant to be read from across the room. */
+QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; font-size: 18px; }
+QListWidget::item { padding: 10px 12px; border-bottom: 1px solid #141420; }
 QListWidget::item:selected { background-color: rgba(232, 160, 48, 0.25); color: #ececec; }
 QListWidget::item:hover { background-color: rgba(232, 160, 48, 0.12); }
 QListWidget::item:disabled { color: #555566; }

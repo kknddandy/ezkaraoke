@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -44,7 +44,7 @@ def make_placeholder_pixmap(text: str, size: int = 40) -> QPixmap:
     painter.setPen(QColor("#a0a0b0"))
     font = QFont()
     font.setBold(True)
-    font.setPointSize(14)
+    font.setPointSize(max(10, size // 3))
     painter.setFont(font)
     painter.drawText(pixmap.rect(), Qt.AlignCenter, text[:1])
     painter.end()
@@ -123,12 +123,14 @@ class SelectWindow(QMainWindow):
         self._btn_mode_artist.setObjectName("ModeButton")
         self._btn_mode_artist.setCheckable(True)
         self._btn_mode_artist.setChecked(True)
+        self._btn_mode_artist.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._btn_mode_artist.clicked.connect(lambda: self._set_mode("artist"))
         mode_layout.addWidget(self._btn_mode_artist)
 
         self._btn_mode_letter = QPushButton("首字母", self)
         self._btn_mode_letter.setObjectName("ModeButton")
         self._btn_mode_letter.setCheckable(True)
+        self._btn_mode_letter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._btn_mode_letter.clicked.connect(lambda: self._set_mode("letter"))
         mode_layout.addWidget(self._btn_mode_letter)
 
@@ -138,13 +140,17 @@ class SelectWindow(QMainWindow):
         self._mode_group.addButton(self._btn_mode_letter)
         left_layout.addWidget(mode_row)
 
+        # Flexible width (fills the splitter pane, no dead space on wide
+        # screens); large icons and text for a touch-friendly selection UI.
         self._artist_list = QListWidget(self)
-        self._artist_list.setFixedWidth(240)
+        self._artist_list.setMinimumWidth(300)
+        self._artist_list.setIconSize(QSize(56, 56))
         self._artist_list.itemSelectionChanged.connect(self._on_artist_selection_changed)
         left_layout.addWidget(self._artist_list, stretch=1)
 
         self._letter_list = QListWidget(self)
-        self._letter_list.setFixedWidth(240)
+        self._letter_list.setMinimumWidth(300)
+        self._letter_list.setIconSize(QSize(56, 56))
         self._letter_list.itemSelectionChanged.connect(self._on_letter_selection_changed)
         self._letter_list.hide()
         left_layout.addWidget(self._letter_list, stretch=1)
@@ -187,13 +193,17 @@ class SelectWindow(QMainWindow):
 
         center_layout.addWidget(toolbar)
 
-        # Song table (click 歌手/歌名 headers to sort; pinyin order for CJK)
+        # Song table (click 歌手/歌名 headers to sort; pinyin order for CJK).
+        # #SongTable gets the large display font via theme.qss.
         self._song_table = QTableWidget(self)
+        self._song_table.setObjectName("SongTable")
         self._song_table.setColumnCount(2)
         self._song_table.setHorizontalHeaderLabels(["歌手", "歌名"])
         self._song_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         self._song_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._song_table.setColumnWidth(0, 170)
+        self._song_table.setColumnWidth(0, 260)
+        # Comfortable breathing room around the 28px display font
+        self._song_table.verticalHeader().setDefaultSectionSize(52)
         # Manual pinyin-aware sorting: Qt's built-in sort compares raw text
         # (and PySide ignores QTableWidgetItem.__lt__), so we sort in Python
         # by pinyin key and re-fill the table.
@@ -283,7 +293,7 @@ class SelectWindow(QMainWindow):
         right_layout.addWidget(queue_bar)
 
         splitter.addWidget(right_widget)
-        splitter.setSizes([240, 700, 340])
+        splitter.setSizes([360, 600, 320])
 
         # Status bar (left: summary, right: progress + current song)
         self._status_bar = QStatusBar(self)
@@ -425,7 +435,7 @@ class SelectWindow(QMainWindow):
         """Cached avatar pixmap (decoded once per avatar, not per refresh)."""
         pixmap = self._avatar_cache.get(name)
         if pixmap is None:
-            pixmap = avatar_pixmap(name, self._db.get_avatar(name))
+            pixmap = avatar_pixmap(name, self._db.get_avatar(name), size=56)
             self._avatar_cache[name] = pixmap
         return pixmap
 

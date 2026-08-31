@@ -1,8 +1,22 @@
 """Tests for ezkaraoke.scanner (no libvlc required)."""
 
 import os
+import time
 
-from ezkaraoke.scanner import VIDEO_EXTS, parse_filename, scan_folder
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PySide6.QtWidgets import QApplication
+
+from ezkaraoke.scanner import VIDEO_EXTS, ScanWorker, parse_filename, scan_folder
+
+
+@pytest.fixture(scope="session")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    yield app
 
 
 # ------------------------------------------------------------- parse_filename
@@ -95,3 +109,34 @@ def test_scan_folder_empty(tmp_path):
 def test_scan_folder_missing_root(tmp_path):
     # os.walk on a missing dir yields nothing -> empty list, no exception
     assert scan_folder(str(tmp_path / "does-not-exist")) == []
+
+
+# ------------------------------------------------------------------ ScanWorker
+def test_scan_worker_finished_signal(qapp, tmp_path):
+    (tmp_path / "周杰伦-晴天.mp4").write_bytes(b"")
+    (tmp_path / "notes.txt").write_bytes(b"")
+
+    results: list[list] = []
+    errors: list[str] = []
+    worker = ScanWorker(str(tmp_path))
+    worker.finished.connect(lambda songs: results.append(songs))
+    worker.error.connect(lambda message: errors.append(message))
+    worker.start()
+    deadline = time.time() + 10
+    while worker.isRunning() and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert worker.wait(5000)
+    for _ in range(100):  # flush queued cross-thread signals
+        qapp.processEvents()
+
+    assert errors == []
+    assert len(results) == 1
+    assert [(s.artist, s.title) for s in results[0]] == [("周杰伦", "晴天")]
+
+
+def test_scan_worker_daemon_thread(qapp, tmp_path):
+    worker = ScanWorker(str(tmp_path))
+    assert worker.daemon is True  # never blocks interpreter shutdown
+    worker.start()
+    assert worker.wait(5000)

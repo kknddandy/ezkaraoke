@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=EzKaraoke
+Name[zh_CN]=易唱K歌
+GenericName=Karaoke Player
+GenericName[zh_CN]=K歌播放器
+Comment=Local KTV player with vocal/accompaniment switching and pitch control
+Comment[zh_CN]=本地KTV点歌播放器：支持原唱/伴奏切换与升调降调
+Exec=ezkaraoke
+Icon=ezkaraoke
+Terminal=false
+Categories=AudioVideo;Player;Music;
+Keywords=karaoke;ktv;music;vlc;sing;
+Keywords[zh_CN]=karaoke;ktv;music;vlc;卡拉OK;
+StartupNotify=true
+StartupWMClass=ezkaraoke

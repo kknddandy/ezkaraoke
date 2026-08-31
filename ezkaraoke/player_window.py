@@ -108,6 +108,21 @@ class PlayerWindow(QMainWindow):
         self._btn_next.clicked.connect(controller.next)
         control_layout.addWidget(self._btn_next)
 
+        self._btn_pitch_down = QPushButton("降调", self)
+        self._btn_pitch_down.setObjectName("ToolButton")
+        self._btn_pitch_down.clicked.connect(lambda: controller.change_pitch(-1))
+        control_layout.addWidget(self._btn_pitch_down)
+
+        self._btn_pitch_up = QPushButton("升调", self)
+        self._btn_pitch_up.setObjectName("ToolButton")
+        self._btn_pitch_up.clicked.connect(lambda: controller.change_pitch(1))
+        control_layout.addWidget(self._btn_pitch_up)
+
+        self._pitch_label = QLabel("原调", self)
+        self._pitch_label.setObjectName("PitchLabel")
+        self._pitch_label.setMinimumWidth(56)
+        control_layout.addWidget(self._pitch_label)
+
         self._btn_track = QPushButton("原唱/伴奏", self)
         self._btn_track.setObjectName("ToolButton")
         self._btn_track.setCheckable(True)
@@ -140,6 +155,7 @@ class PlayerWindow(QMainWindow):
         self._controller.state_changed.connect(self._on_state_changed)
         self._controller.status_message.connect(self._on_status_message)
         self._controller.audio_track_changed.connect(self._on_audio_track)
+        self._controller.pitch_changed.connect(self._on_pitch)
 
         # Defer video output setup until winId is valid
         QTimer.singleShot(0, self._setup_video_output)
@@ -199,6 +215,17 @@ class PlayerWindow(QMainWindow):
         self._btn_track.setChecked(index == 1)
         self._btn_track.setToolTip(
             f"当前音轨：{'伴奏' if index else '原唱'}" if multi else "该歌曲没有可切换的音轨"
+        )
+
+    def _on_pitch(self, semis: int) -> None:
+        if semis == 0:
+            self._pitch_label.setText("原调")
+        elif semis > 0:
+            self._pitch_label.setText(f"升{semis}")
+        else:
+            self._pitch_label.setText(f"降{-semis}")
+        self._pitch_label.setToolTip(
+            "纯变调" if self._controller.pitch_is_pure else "变调同时改变速度（VLC < 4）"
         )
 
     def _on_status_message(self, message: str) -> None:

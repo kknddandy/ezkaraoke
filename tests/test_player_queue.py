@@ -46,6 +46,21 @@ class FakePlayer:
         self.count = count
         self.set_calls: list[int] = []
         self.current: int = 1 if count else -1
+        self.rates: list[float] = []
+        # stand-in for python-vlc's _Ctype ctypes protocol attribute
+        self._as_parameter_ = object()
+
+    def stop(self) -> None:
+        pass
+
+    def play(self) -> None:
+        pass
+
+    def set_media(self, media) -> None:
+        pass
+
+    def set_rate(self, rate: float) -> None:
+        self.rates.append(float(rate))
 
     def audio_get_track_count(self) -> int:
         return self.count + 1 if self.count else 0
@@ -611,3 +626,66 @@ def test_sync_audio_track_pending_when_not_ready(qapp):
     p.audio_track_changed.connect(emissions.append)
     p._sync_audio_track(0)  # schedules a bounded retry timer; do NOT run events
     assert emissions == []
+
+
+# ------------------------------------------------------------------ pitch
+def test_pitch_default_zero(qapp):
+    p = PlayerController()
+    assert p.pitch_semitones == 0
+    assert p.pitch_is_pure in (True, False)  # depends on runtime libvlc; no crash
+
+
+def test_set_pitch_clamps(qapp):
+    p = PlayerController()
+    p._player = FakePlayer()
+    emissions: list[int] = []
+    p.pitch_changed.connect(emissions.append)
+    p.set_pitch(99)
+    assert p.pitch_semitones == 12
+    assert emissions == [12]
+    p.set_pitch(-99)
+    assert p.pitch_semitones == -12
+    assert emissions == [12, -12]
+
+
+def test_pitch_fallback_uses_rate(qapp):
+    # No real vlc here: _pitch_fn is None, so set_rate (tape speed) is used.
+    p = PlayerController()
+    p._player = FakePlayer()
+    assert p._pitch_fn is None
+    emissions: list[int] = []
+    p.pitch_changed.connect(emissions.append)
+    p.set_pitch(1)
+    assert p._player.rates == pytest.approx([2.0 ** (1 / 12)])
+    p.change_pitch(1)
+    assert p._player.rates == pytest.approx([2.0 ** (1 / 12), 2.0 ** (2 / 12)])
+    p.set_pitch(2)  # unchanged (already 2 after change_pitch): no re-apply
+    assert p._player.rates == pytest.approx([2.0 ** (1 / 12), 2.0 ** (2 / 12)])
+    # no duplicate emission: exactly [1, 2] over the whole sequence
+    assert emissions == [1, 2]
+
+
+def test_pitch_uses_pitch_fn_when_available(qapp):
+    p = PlayerController()
+    p._player = FakePlayer()
+    recorder: list[float] = []
+    # pct arrives as ctypes.c_float; .value (float(pct) is gone on 3.14)
+    p._pitch_fn = lambda mp, pct: recorder.append(pct.value)
+    p.set_pitch(-2)
+    assert recorder == pytest.approx([100.0 * 2.0 ** (-2 / 12)])
+    assert p._player.rates == []  # fallback not used when pitch fn is available
+
+
+def test_pitch_reapplied_on_new_media(qapp):
+    class FakeVlc:
+        def media_new(self, path: str):
+            return object()
+
+    p = PlayerController()
+    p._player = FakePlayer(2)
+    p._vlc = FakeVlc()
+    p.set_pitch(3)
+    p.play_now(make("A", "t"))
+    # _start_vlc resets the player; the preferred pitch must be reapplied.
+    # (the pending singleShot timer is harmless; do NOT run the event loop)
+    assert p._player.rates[-1] == pytest.approx(2.0 ** (3 / 12))

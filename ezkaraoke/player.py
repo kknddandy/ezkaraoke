@@ -7,11 +7,31 @@ becomes a no-op and ``status_message`` is emitted once.
 
 from __future__ import annotations
 
+import ctypes
+
 from PySide6.QtCore import QObject, Signal, QTimer
 
 from ezkaraoke.library import Song
 
 _NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启 (sudo apt install vlc)"
+
+
+def _detect_pitch_fn(vlc_module):
+    """libvlc_media_player_set_audio_pitch when the runtime has it (VLC >= 4)."""
+    libs = []
+    lib = getattr(vlc_module, "libvlc", None)
+    if lib is not None:
+        libs.append(lib)
+    for soname in ("libvlc.so.5", "libvlc.so.4", "libvlc.so.3", "libvlc.so.12", "libvlc.so.11"):
+        try:
+            libs.append(ctypes.CDLL(soname))
+        except OSError:
+            continue
+    for lib in libs:
+        fn = getattr(lib, "libvlc_media_player_set_audio_pitch", None)
+        if fn is not None:
+            return fn
+    return None
 
 
 class PlayerController(QObject):
@@ -20,12 +40,15 @@ class PlayerController(QObject):
     state_changed = Signal(str)      # "playing" | "paused" | "stopped"
     status_message = Signal(str)     # warnings, e.g. missing libvlc
     audio_track_changed = Signal(int)  # active track index (0=原唱, 1=伴奏)
+    pitch_changed = Signal(int)        # semitones, 0 = 原调
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._queue: list[Song] = []
         self._current_index: int = -1
         self._state: str = "stopped"
+        self._pitch_semitones = 0
+        self._pitch_fn = None
         # vlc objects, lazily created (None until first playback request)
         self._vlc = None
         self._player = None
@@ -62,6 +85,15 @@ class PlayerController(QObject):
     def audio_track_index(self) -> int:
         return self._audio_track_index
 
+    @property
+    def pitch_semitones(self) -> int:
+        return self._pitch_semitones
+
+    @property
+    def pitch_is_pure(self) -> bool:
+        """True when a real pitch shift (no tempo change) is available."""
+        return self._pitch_fn is not None
+
     # ------------------------------------------------------------------- vlc
     def _ensure_vlc(self) -> bool:
         """Lazily create the vlc Instance + MediaPlayer.
@@ -84,6 +116,10 @@ class PlayerController(QObject):
             self._warn_no_vlc()
             return False
         self._vlc_available = True
+        try:
+            self._pitch_fn = _detect_pitch_fn(vlc)
+        except Exception:  # noqa: BLE001 - detection is best-effort
+            self._pitch_fn = None
         try:
             event_manager = self._player.event_manager()
             # Note: no trailing positional argument — python-vlc forwards
@@ -122,6 +158,8 @@ class PlayerController(QObject):
             self._player.set_media(self._current_media)
             self._player.play()
             QTimer.singleShot(0, lambda: self._sync_audio_track(0))
+            # VLC resets rate/pitch per new media; reapply the preferred pitch.
+            self._apply_pitch()
         except Exception as e:  # noqa: BLE001 - playback failure is a warning
             self.status_message.emit(str(e))
 
@@ -388,6 +426,41 @@ class PlayerController(QObject):
                 preferred = 0
         self._audio_track_index = preferred
         self.audio_track_changed.emit(preferred)
+
+    # ------------------------------------------------------------------ pitch
+    def set_pitch(self, semitones: int) -> None:
+        """Set pitch shift in semitones, clamped to [-12, 12]. No-op when unchanged."""
+        target = max(-12, min(12, int(semitones)))
+        if target == self._pitch_semitones:
+            return
+        self._pitch_semitones = target
+        self._apply_pitch()
+        self.pitch_changed.emit(target)
+
+    def change_pitch(self, delta: int) -> None:
+        self.set_pitch(self._pitch_semitones + delta)
+
+    def _apply_pitch(self) -> None:
+        player = self._player
+        if player is None:
+            return
+        semis = self._pitch_semitones
+        if self._pitch_fn is not None:
+            try:
+                # player._as_parameter_ is the python-vlc _Ctype ctypes
+                # protocol attribute: raw c_void_p + c_float, no argtypes.
+                self._pitch_fn(
+                    player._as_parameter_,
+                    ctypes.c_float(100.0 * (2.0 ** (semis / 12.0))),
+                )
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        # VLC < 4 fallback: tape speed — pitch AND tempo shift together
+        try:
+            player.set_rate(2.0 ** (semis / 12.0))
+        except Exception:  # noqa: BLE001
+            pass
 
     def attach_video_callbacks(self, lock_cb, unlock_cb, setup_cb, cleanup_cb) -> bool:
         """Register custom video output callbacks (software rendering).

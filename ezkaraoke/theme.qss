@@ -220,6 +220,20 @@ QTreeWidget::branch:open:has-children:has-siblings {
     border-image: none;
 }
 
+/* ===== List Widget (artist / letter indexes) ===== */
+QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; }
+QListWidget::item { padding: 6px 8px; border-bottom: 1px solid #141420; }
+QListWidget::item:selected { background-color: rgba(232, 160, 48, 0.25); color: #ececec; }
+QListWidget::item:hover { background-color: rgba(232, 160, 48, 0.12); }
+QListWidget::item:disabled { color: #555566; }
+
+/* Mode toggle buttons */
+QPushButton#ModeButton { padding: 6px 12px; font-size: 13px; }
+QPushButton#ModeButton:checked { background-color: #e8a030; color: #0c0c14; border-color: #e8a030; font-weight: bold; }
+
+/* Pitch label in player control bar */
+QLabel#PitchLabel { color: #e8a030; font-size: 13px; padding: 2px 8px; border-radius: 4px; background-color: #1e1e2f; }
+
 /* ===== Scrollbars ===== */
 QScrollBar:vertical {
     background-color: #0c0c14;
@@ -273,6 +287,22 @@ QStatusBar {
 
 QStatusBar::item {
     border: none;
+}
+
+QProgressBar {
+    background-color: #1e1e30;
+    border: 1px solid #3a3a55;
+    border-radius: 5px;
+    color: #c8c8d8;
+    text-align: center;
+    font-size: 12px;
+    min-height: 18px;
+    margin: 2px 8px 2px 4px;
+}
+
+QProgressBar::chunk {
+    background-color: #e8a030;
+    border-radius: 4px;
 }
 
 /* ===== Tool Bar ===== */

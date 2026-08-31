@@ -1,2 +1,3 @@
 PySide6>=6.6
 python-vlc>=3.0.21000
+pypinyin>=0.51

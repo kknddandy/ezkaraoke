@@ -11,6 +11,8 @@ import urllib.error
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PySide6.QtCore import qInstallMessageHandler
+from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 
 from ezkaraoke import avatar as avatar_mod
@@ -330,3 +332,76 @@ def test_strip_png_iccp_non_png_and_truncated_unchanged():
     assert avatar_mod.strip_png_iccp(jpeg) == jpeg
     png = _png_with_iccp()
     assert avatar_mod.strip_png_iccp(png[:20]) == png[:20]
+
+
+# --- Regression: malformed embedded ICC profile triggers Qt warnings -------
+#
+# Some web images embed ICC profiles whose tag table contains offsets that
+# are not 4-byte aligned. Qt logs "qt.gui.icc: fromIccProfile: invalid tag
+# offset alignment" while decoding such PNGs. The profile only tweaks
+# colourimetry, so the search path strips the iCCP chunk before decoding.
+
+# First 128 bytes of a real D50 display profile (ECI-RGBv1.icc): header +
+# illuminant, which is exactly what Qt's isValidIccProfile() validates.
+_ECI_HEADER_B64 = (
+    "AABQLGxjbXMEQAAAbW50clJHQiBYWVogB+oAAgAQABEAKQAAYWNzcEFQUEw"
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAPbWAAEAAAAA0y1sY21z0ASn"
+    "PgwsgZuVgFNRevmlygAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+)
+
+
+def _trigger_profile() -> bytes:
+    """Near-real ICC display profile (D50) with a tag offset not 4-byte aligned."""
+    import base64
+    import struct
+
+    prof = bytearray(base64.b64decode(_ECI_HEADER_B64))  # real profile header
+    total = 152
+    prof[0:4] = struct.pack(">I", total)
+    prof += struct.pack(">I", 1)  # tagCount
+    prof += b"desc" + struct.pack(">II", 141, 8)  # offset 141 == 4n+1
+    prof += b"\x00" * (total - len(prof))
+    return bytes(prof)
+
+
+def _trigger_png() -> bytes:
+    # Noise pixels keep the file incompressible so it clears the 5 KB
+    # minimum-size filter in _search_image_data.
+    import io
+    import os
+
+    from PIL import Image
+
+    img = Image.frombytes("RGB", (120, 120), os.urandom(120 * 120 * 3))
+    buf = io.BytesIO()
+    img.save(buf, "PNG", icc_profile=_trigger_profile())
+    return buf.getvalue()
+
+
+def _icc_warnings(data: bytes) -> list[str]:
+    msgs: list[str] = []
+    qInstallMessageHandler(lambda *a: msgs.append(" ".join(str(x) for x in a)))
+    try:
+        img = QImage()
+        img.loadFromData(data)
+    finally:
+        qInstallMessageHandler(None)
+    return [m for m in msgs if "icc" in m.lower()]
+
+
+def test_malformed_iccp_png_warns_when_loaded_raw(qapp):
+    # Guards the fixture: if Qt stops warning about this profile, the
+    # regression test below would prove nothing.
+    assert _icc_warnings(_trigger_png())
+
+
+def test_search_image_data_strips_iccp_and_qt_stays_silent(monkeypatch, qapp):
+    trigger = _trigger_png()
+    monkeypatch.setattr(
+        avatar_mod, "_bing_image_urls", lambda name: ["http://test/cand.png"]
+    )
+    monkeypatch.setattr(avatar_mod, "_browser_get", lambda *a, **k: trigger)
+    result = avatar_mod._search_image_data("Test Artist")
+    assert result is not None
+    assert b"iCCP" not in _chunk_types(result)
+    assert _icc_warnings(result) == []

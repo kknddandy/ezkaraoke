@@ -161,6 +161,8 @@ def _search_image_data(name: str) -> bytes | None:
             continue
         if len(data) <= 5000 or not _looks_like_image(data):
             continue
+        if data[:4] == b"\x89PNG":
+            data = strip_png_iccp(data)  # malformed iCCP triggers qt.gui.icc warnings
         img = QImage()
         if img.loadFromData(data) and min(img.width(), img.height()) >= _MIN_SEARCH_EDGE:
             return data

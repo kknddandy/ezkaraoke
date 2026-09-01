@@ -291,6 +291,9 @@ class SelectWindow(QMainWindow):
         self._song_table.setAlternatingRowColors(True)
         self._song_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._song_table.doubleClicked.connect(self._on_song_double_clicked)
+        # Re-enable the action buttons as soon as the user (de)selects rows;
+        # without this they stay disabled until the next table refresh.
+        self._song_table.itemSelectionChanged.connect(self._update_button_states)
         self._song_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._song_table.customContextMenuRequested.connect(self._on_song_context_menu)
         center_layout.addWidget(self._song_table, stretch=1)
@@ -315,6 +318,11 @@ class SelectWindow(QMainWindow):
         self._btn_play_now.setObjectName("ToolButton")
         self._btn_play_now.clicked.connect(self._play_now_selected)
         action_layout.addWidget(self._btn_play_now)
+
+        self._btn_play = QPushButton("播放", self)
+        self._btn_play.setObjectName("ToolButton")
+        self._btn_play.clicked.connect(self._controller.toggle_pause)
+        action_layout.addWidget(self._btn_play)
 
         self._btn_track = QPushButton("原唱/伴奏", self)
         self._btn_track.setObjectName("ToolButton")
@@ -392,6 +400,7 @@ class SelectWindow(QMainWindow):
         # Connect controller signals
         self._controller.queue_changed.connect(self._refresh_queue)
         self._controller.current_changed.connect(self._highlight_current_queue)
+        self._controller.state_changed.connect(self._on_state_changed)
         self._controller.status_message.connect(self._on_status_message)
         self._controller.audio_track_changed.connect(self._on_audio_track)
 
@@ -658,12 +667,16 @@ class SelectWindow(QMainWindow):
         return songs
 
     def _append_selected(self) -> None:
+        was_empty = not self._controller.queue
         for song in self._selected_songs():
             self._controller.append(song)
+        self._start_if_first_song(was_empty)
 
     def _insert_selected(self) -> None:
+        was_empty = not self._controller.queue
         for song in self._selected_songs():
             self._controller.insert_next(song)
+        self._start_if_first_song(was_empty)
 
     def _play_now_selected(self) -> None:
         songs = self._selected_songs()
@@ -673,7 +686,14 @@ class SelectWindow(QMainWindow):
     def _on_song_double_clicked(self) -> None:
         songs = self._selected_songs()
         if songs:
+            was_empty = not self._controller.queue
             self._controller.append(songs[0])
+            self._start_if_first_song(was_empty)
+
+    def _start_if_first_song(self, was_empty: bool) -> None:
+        """An empty queue starts playing the first song that is added."""
+        if was_empty and self._controller.queue:
+            self._controller.play_at(0)
 
     # ===== Right-click: permanent delete =====
 
@@ -823,6 +843,9 @@ class SelectWindow(QMainWindow):
         self._btn_track.setEnabled(
             self._controller.current_index >= 0 and self._controller.has_multi_audio_track()
         )
+
+    def _on_state_changed(self, state: str) -> None:
+        self._btn_play.setText("暂停" if state == "playing" else "播放")
 
     def _on_audio_track(self, index: int) -> None:
         multi = self._controller.has_multi_audio_track()

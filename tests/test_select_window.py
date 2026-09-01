@@ -458,3 +458,66 @@ def test_context_menu_delete_current_song_stops_playback(qapp, tmp_path, monkeyp
         window.close()
         qapp.processEvents()
         db.close()
+
+
+# ------------------------------------------------- empty queue auto-play
+def test_append_to_empty_queue_autoplays_first_song(qapp, win):
+    win._song_table.selectRow(0)
+    win._btn_append.click()
+    assert len(win._controller.queue) == 1
+    assert win._controller.current_index == 0
+    assert win._controller.is_playing
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_insert_to_empty_queue_autoplays_first_song(qapp, win):
+    win._song_table.selectRow(0)
+    win._btn_insert.click()
+    assert win._controller.current_index == 0
+    assert win._controller.is_playing
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_double_click_empty_queue_autoplays_first_song(qapp, win):
+    win._song_table.selectRow(0)
+    win._on_song_double_clicked()
+    assert win._controller.current_index == 0
+    assert win._controller.is_playing
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_append_to_playing_queue_does_not_restart(qapp, win):
+    win._song_table.selectRow(0)
+    win._btn_append.click()  # empty queue -> auto-plays song 0
+    assert win._controller.is_playing
+    win._song_table.selectRow(1)
+    win._btn_append.click()  # queue already non-empty -> just appends
+    qapp.processEvents()
+    assert len(win._controller.queue) == 2
+    assert win._controller.current_index == 0
+    assert win._controller.is_playing
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_play_pause_button(qapp, win):
+    c = win._controller
+    assert win._btn_play.text() == "播放"
+    win._btn_play.click()  # nothing playing -> stays stopped
+    assert c.current_index == -1
+    assert win._btn_play.text() == "播放"
+    win._song_table.selectRow(0)
+    win._btn_append.click()  # auto-plays (empty queue)
+    assert win._btn_play.text() == "暂停"
+    win._btn_play.click()
+    assert c.is_paused
+    assert win._btn_play.text() == "播放"
+    win._btn_play.click()
+    assert c.is_playing
+    assert win._btn_play.text() == "暂停"
+    c.stop()
+    qapp.processEvents()
+    assert win._btn_play.text() == "播放"

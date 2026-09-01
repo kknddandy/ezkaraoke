@@ -10,6 +10,8 @@ import os
 # Offscreen platform: no display server is available on this machine.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import time
+
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -482,6 +484,123 @@ def test_media_end_at_last_song_stops(qapp):
     p._on_media_end(object())  # last song ended -> stop, no raise
     assert p.current_index == -1
     assert not p.is_playing
+
+
+def test_media_end_from_libvlc_thread_advances_on_main_thread(qapp):
+    """EndReached arrives on a libvlc worker thread.
+
+    The callback must only record + emit; the actual advance (which calls
+    libvlc) is delivered as a queued signal on the main thread. Before the
+    fix the callback called libvlc in place and deadlocked at the end of
+    the queue, freezing the whole app ("Python 停止响应").
+    """
+    import threading
+
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    p.play_at(0)
+    assert p.current_index == 0
+
+    def fire():
+        p._on_media_end(object())  # what python-vlc invokes on its thread
+
+    t = threading.Thread(target=fire)
+    t.start()
+    deadline = time.time() + 5
+    while p.current_index == 0 and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    t.join(5)
+    assert p.current_index == 1
+    assert p.is_playing
+    p.stop()
+
+
+def test_media_end_slot_ignores_stale_token(qapp):
+    """A queued EndReached that is processed after the user already moved
+    on must not advance a second time."""
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    p.play_at(0)
+    gen1, gen2 = object(), object()
+    p._current_media, p._active_path = gen1, "/gen1"
+    p._ended_token = (id(gen1), "/gen1")  # end event for gen1 pending
+    p._current_media, p._active_path = gen2, "/gen2"  # user moved on
+    p._on_media_ended()
+    assert p.current_index == 0  # stale event ignored
+    p._ended_token = (id(gen2), "/gen2")  # matching event still advances
+    p._on_media_ended()
+    assert p.current_index == 1
+    p.stop()
+
+
+def test_media_end_after_stop_does_not_resume(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.play_at(0)
+    p.stop()
+    p._on_media_ended()  # a late end event for the stopped player
+    assert p.current_index == -1
+    assert not p.is_playing
+
+
+def test_playlist_drains_to_stopped_without_freezing(qapp, tmp_path):
+    """End-to-end freeze regression: play two short real files to the end.
+
+    The queue must drain to stopped while the Qt main loop keeps handling
+    events. Before the fix the EndReached handler called libvlc from the
+    libvlc event thread (libvlc_media_player_stop), which blocked itself
+    and dragged the main thread down with it — the app froze with a
+    "Python 停止响应" dialog at the end of the playlist.
+    """
+    import shutil
+    import subprocess
+
+    if not _libvlc_available():
+        pytest.skip("libvlc not available")
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not available")
+
+    from PySide6.QtCore import QTimer
+
+    from ezkaraoke.frame_bridge import FrameBridge
+
+    files = []
+    for name in ("p1", "p2"):
+        f = tmp_path / f"{name}.mp4"
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=10",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-c:v", "mpeg4", "-q:v", "8", "-c:a", "aac", "-shortest",
+                str(f),
+            ],
+            check=True,
+        )
+        files.append(f)
+
+    p = PlayerController()
+    p.append(Song("A", "p1", str(files[0])))
+    p.append(Song("B", "p2", str(files[1])))
+    bridge = FrameBridge()  # same software video path the app uses headless
+    p.attach_video_callbacks(*bridge.video_callbacks, *bridge.format_callbacks)
+    p.play_at(0)
+
+    beats = {"n": 0}
+    hb = QTimer()
+    hb.timeout.connect(lambda: beats.__setitem__("n", beats["n"] + 1))
+    hb.start(100)
+    deadline = time.time() + 25
+    while p.current_index != -1 and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    hb.stop()
+    assert p.current_index == -1, "queue did not drain to stopped"
+    assert not p.is_playing
+    assert beats["n"] > 10, "main loop starved while the playlist played"
 
 
 # ------------------------------------------------------------ set_video_output

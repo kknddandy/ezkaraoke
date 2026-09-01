@@ -90,6 +90,7 @@ class PlayerController(QObject):
     pitch_changed = Signal(int)        # semitones, 0 = 原调
     pitch_status = Signal(str)         # "" idle | "shifting" generating variant
     pitch_progress = Signal(float)     # 0.0 .. 1.0 while shifting
+    _media_ended = Signal()            # internal: EndReached (libvlc thread) -> main thread
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -108,6 +109,8 @@ class PlayerController(QObject):
         self._audio_track_index = 0  # preferred track, persists across songs
         self._shift_worker: _PitchShiftWorker | None = None
         self._active_path: str | None = None  # file currently loaded in VLC
+        self._ended_token = None  # identity of the media whose EndReached arrived
+        self._media_ended.connect(self._on_media_ended)
 
     # ------------------------------------------------------------------ state
     @property
@@ -188,7 +191,28 @@ class PlayerController(QObject):
             self.status_message.emit(_NO_VLC_MESSAGE)
 
     def _on_media_end(self, event) -> None:
+        """libvlc EndReached handler — runs on the libvlc event thread.
+
+        Must not call libvlc (stop / set_media / play) or touch Qt here:
+        the event fires while the input thread is still finishing the
+        media, and a player call made inside the callback deadlocks
+        against it — at the end of the queue the whole app freezes
+        ("Python 停止响应"). Record which media ended and post to the
+        Qt main thread instead.
+        """
         if self._advancing:
+            return
+        self._ended_token = (id(self._current_media), self._active_path)
+        self._media_ended.emit()
+
+    def _on_media_ended(self) -> None:
+        """Main-thread half of EndReached: advance the queue.
+
+        Skipped when the user already moved on (next / stop / removed
+        the current song): the loaded media is no longer the one that
+        just ended, so the queued event is stale.
+        """
+        if self._ended_token != (id(self._current_media), self._active_path):
             return
         self._advancing = True
         try:
@@ -394,6 +418,7 @@ class PlayerController(QObject):
 
     def stop(self) -> None:
         """Stop playback; the queue is kept, current_index becomes -1."""
+        self._ended_token = None  # a pending end event must not resume
         self._stop_vlc()
         if self._current_index != -1:
             self._current_index = -1

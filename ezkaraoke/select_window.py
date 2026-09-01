@@ -1,7 +1,15 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtCore import Qt, QPoint, QRect, QSize
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QPainter,
+    QPainterPath,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFileDialog,
@@ -12,6 +20,8 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
+    QMessageBox,
     QPushButton,
     QProgressBar,
     QSizePolicy,
@@ -23,17 +33,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ezkaraoke.avatar import AvatarWorker
+from ezkaraoke.avatar import AvatarWorker, strip_png_iccp
 from ezkaraoke.config import Config, save_config
 from ezkaraoke.database import SongDatabase
 from ezkaraoke.letters import pinyin_key
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
+from ezkaraoke.pitchshift import remove_cached_for
 from ezkaraoke.scanner import ScanWorker
 
 
+def placeholder_label(text: str) -> str:
+    """Placeholder icon text for *text*.
+
+    CJK names get "中D-丁" (pinyin initial letter made explicit so the
+    sort order is visible at a glance); other names keep the first char.
+    The letter comes from the whole name, not the first char alone, so
+    pypinyin's phrase disambiguation applies (长春 -> ch, not zh).
+    """
+    stripped = text.strip()
+    ch = stripped[:1]
+    if ch and not ch.isascii():
+        key = pinyin_key(stripped)
+        if key and key[0]:
+            letter = key[0][0].upper()
+            if letter.isascii() and letter.isalpha():
+                return f"中{letter}-{ch}"
+    return ch or "·"
+
+
 def make_placeholder_pixmap(text: str, size: int = 40) -> QPixmap:
-    """Rounded square with the first character of *text* centered."""
+    """Rounded square with the placeholder label of *text* centered."""
+    label = placeholder_label(text)
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
@@ -44,9 +75,9 @@ def make_placeholder_pixmap(text: str, size: int = 40) -> QPixmap:
     painter.setPen(QColor("#a0a0b0"))
     font = QFont()
     font.setBold(True)
-    font.setPointSize(max(10, size // 3))
+    font.setPointSize(max(10, size // (3 if len(label) <= 1 else 5)))
     painter.setFont(font)
-    painter.drawText(pixmap.rect(), Qt.AlignCenter, text[:1])
+    painter.drawText(pixmap.rect(), Qt.AlignCenter, label)
     painter.end()
     return pixmap
 
@@ -65,20 +96,65 @@ class _SongItem(QTableWidgetItem):
 
 
 def avatar_pixmap(name: str, data: bytes | None, size: int = 40) -> QPixmap:
-    """Loaded and center-cropped avatar, or a placeholder when unavailable."""
+    """Avatar with the pinyin letter label always drawn on top.
+
+    With image data the center-cropped photo fills the icon and the
+    label ("中D-丁" / "C") is drawn over it with a semi-transparent
+    chip for legibility; without data the label sits on the dark
+    placeholder. The sort letter stays visible whether or not a photo
+    was found.
+    """
+    label = placeholder_label(name)
+    photo = None
     if data:
-        pixmap = QPixmap()
-        if pixmap.loadFromData(data):
-            pixmap = pixmap.scaled(
+        if data[:4] == b"\x89PNG":
+            data = strip_png_iccp(data)  # malformed iCCP triggers qt.gui.icc warnings
+        pm = QPixmap()
+        if pm.loadFromData(data):
+            pm = pm.scaled(
                 size,
                 size,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            x = (pixmap.width() - size) // 2
-            y = (pixmap.height() - size) // 2
-            return pixmap.copy(x, y, size, size)
-    return make_placeholder_pixmap(name, size)
+            x = (pm.width() - size) // 2
+            y = (pm.height() - size) // 2
+            photo = pm.copy(x, y, size, size)
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    painter.setPen(Qt.NoPen)
+    clip = QPainterPath()
+    clip.addRoundedRect(0, 0, size, size, 6, 6)
+    painter.setClipPath(clip)
+    if photo is not None:
+        painter.drawPixmap(0, 0, photo)
+    else:
+        painter.setBrush(QColor("#2a2a3e"))
+        painter.drawRect(0, 0, size, size)
+    font = QFont()
+    font.setBold(True)
+    font.setPointSize(max(8, size // (3 if len(label) <= 1 else 5)))
+    painter.setFont(font)
+    fm = QFontMetrics(font)
+    text_w = fm.horizontalAdvance(label)
+    text_h = fm.height()
+    pad = max(2, size // 28)
+    chip = QRect(
+        (size - text_w) // 2 - pad,
+        (size - text_h) // 2 - pad,
+        text_w + 2 * pad,
+        text_h + 2 * pad,
+    )
+    painter.setPen(Qt.NoPen)
+    painter.setBrush(QColor(20, 20, 34, 170))
+    painter.drawRoundedRect(chip, 4, 4)
+    painter.setPen(QColor("#ffffff") if photo is not None else QColor("#a0a0b0"))
+    painter.drawText(chip, Qt.AlignCenter, label)
+    painter.end()
+    return pixmap
 
 
 class SelectWindow(QMainWindow):
@@ -141,16 +217,16 @@ class SelectWindow(QMainWindow):
         left_layout.addWidget(mode_row)
 
         # Flexible width (fills the splitter pane, no dead space on wide
-        # screens); large icons and text for a touch-friendly selection UI.
+        # screens); oversized icons and text for a touch-friendly selection UI.
         self._artist_list = QListWidget(self)
-        self._artist_list.setMinimumWidth(300)
-        self._artist_list.setIconSize(QSize(56, 56))
+        self._artist_list.setMinimumWidth(440)
+        self._artist_list.setIconSize(QSize(112, 112))
         self._artist_list.itemSelectionChanged.connect(self._on_artist_selection_changed)
         left_layout.addWidget(self._artist_list, stretch=1)
 
         self._letter_list = QListWidget(self)
-        self._letter_list.setMinimumWidth(300)
-        self._letter_list.setIconSize(QSize(56, 56))
+        self._letter_list.setMinimumWidth(440)
+        self._letter_list.setIconSize(QSize(112, 112))
         self._letter_list.itemSelectionChanged.connect(self._on_letter_selection_changed)
         self._letter_list.hide()
         left_layout.addWidget(self._letter_list, stretch=1)
@@ -215,6 +291,8 @@ class SelectWindow(QMainWindow):
         self._song_table.setAlternatingRowColors(True)
         self._song_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._song_table.doubleClicked.connect(self._on_song_double_clicked)
+        self._song_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._song_table.customContextMenuRequested.connect(self._on_song_context_menu)
         center_layout.addWidget(self._song_table, stretch=1)
 
         # Action buttons
@@ -293,7 +371,9 @@ class SelectWindow(QMainWindow):
         right_layout.addWidget(queue_bar)
 
         splitter.addWidget(right_widget)
-        splitter.setSizes([360, 600, 320])
+        # Left pane sized to the oversized list content (~500px on 1920);
+        # the pane can still be dragged wider, the list follows.
+        splitter.setSizes([340, 640, 300])
 
         # Status bar (left: summary, right: progress + current song)
         self._status_bar = QStatusBar(self)
@@ -435,7 +515,7 @@ class SelectWindow(QMainWindow):
         """Cached avatar pixmap (decoded once per avatar, not per refresh)."""
         pixmap = self._avatar_cache.get(name)
         if pixmap is None:
-            pixmap = avatar_pixmap(name, self._db.get_avatar(name), size=56)
+            pixmap = avatar_pixmap(name, self._db.get_avatar(name), size=112)
             self._avatar_cache[name] = pixmap
         return pixmap
 
@@ -446,7 +526,11 @@ class SelectWindow(QMainWindow):
         all_item.setData(Qt.UserRole, None)
         all_item.setIcon(QIcon(self._avatar_pixmap("全")))
         self._artist_list.addItem(all_item)
-        for name, count in self._db.artist_counts():
+        ordered = sorted(
+            self._db.artist_counts(),
+            key=lambda p: [s.lower() for s in pinyin_key(p[0])],
+        )
+        for name, count in ordered:
             item = QListWidgetItem(f"{name} ({count})")
             item.setData(Qt.UserRole, name)
             item.setIcon(QIcon(self._avatar_pixmap(name)))
@@ -590,6 +674,63 @@ class SelectWindow(QMainWindow):
         songs = self._selected_songs()
         if songs:
             self._controller.append(songs[0])
+
+    # ===== Right-click: permanent delete =====
+
+    def _on_song_context_menu(self, pos: QPoint) -> None:
+        row = self._song_table.rowAt(pos.y())
+        if row < 0:
+            return
+        artist_item = self._song_table.item(row, 0)
+        title_item = self._song_table.item(row, 1)
+        path = artist_item.data(Qt.UserRole) if artist_item is not None else None
+        if artist_item is None or title_item is None or not path:
+            return
+        self._song_table.selectRow(row)
+        song = Song(artist_item.text(), title_item.text(), path)
+        menu = QMenu(self)
+        delete_action = menu.addAction("永久删除")
+        delete_action.setToolTip(f"从磁盘删除视频文件：{song.path}")
+        if menu.exec(self._song_table.mapToGlobal(pos)) is delete_action:
+            self._confirm_delete_song(song)
+
+    def _confirm_delete_song(self, song: Song) -> None:
+        reply = QMessageBox.question(
+            self,
+            "永久删除",
+            f"确定要永久删除这首歌曲吗？\n\n{song.display}\n\n"
+            f"将删除视频文件：\n{song.path}\n\n此操作不可撤销。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self._delete_song(song)
+
+    def _delete_song(self, song: Song) -> None:
+        path = Path(song.path)
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError as exc:
+                self._status_bar.showMessage(f"删除文件失败：{exc}", 5000)
+                return
+        # Stop playback and drop every queued copy before the file is gone.
+        current = self._controller.current_song
+        if current is not None and current.path == song.path:
+            self._controller.stop()
+        queue = self._controller.queue
+        for i in range(len(queue) - 1, -1, -1):
+            if queue[i].path == song.path:
+                self._controller.remove_at(i)
+        self._db.delete_song(song.path)
+        remove_cached_for(song.path)
+        self._refresh_artist_list()
+        self._refresh_letter_list()
+        self._refresh_song_table()
+        self._refresh_queue()
+        self._update_button_states()
+        self._status_left.setText(f"共 {self._db.song_count()} 首（本地数据库）")
+        self._status_bar.showMessage(f"已永久删除《{song.title}》", 5000)
 
     # ===== Avatar fetching =====
 

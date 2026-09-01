@@ -156,6 +156,11 @@ class PlayerWindow(QMainWindow):
         self._controller.status_message.connect(self._on_status_message)
         self._controller.audio_track_changed.connect(self._on_audio_track)
         self._controller.pitch_changed.connect(self._on_pitch)
+        self._controller.pitch_status.connect(self._on_pitch_status)
+        self._controller.pitch_progress.connect(self._on_pitch_progress)
+        self._pitch_base = "原调"
+        self._shifting = False
+        self._shifting_frac = 0.0
 
         # Defer video output setup until winId is valid
         QTimer.singleShot(0, self._setup_video_output)
@@ -219,14 +224,31 @@ class PlayerWindow(QMainWindow):
 
     def _on_pitch(self, semis: int) -> None:
         if semis == 0:
-            self._pitch_label.setText("原调")
+            self._pitch_base = "原调"
         elif semis > 0:
-            self._pitch_label.setText(f"升{semis}")
+            self._pitch_base = f"升{semis}"
         else:
-            self._pitch_label.setText(f"降{-semis}")
+            self._pitch_base = f"降{-semis}"
         self._pitch_label.setToolTip(
-            "纯变调" if self._controller.pitch_is_pure else "变调同时改变速度（VLC < 4）"
+            "纯变调（rubberband，首次使用需后台生成，约 1 分钟）"
+            if self._controller.pitch_is_pure
+            else "缺少 ffmpeg：变调同时改变速度"
         )
+        self._update_pitch_label()
+
+    def _on_pitch_status(self, status: str) -> None:
+        self._shifting = status == "shifting"
+        self._update_pitch_label()
+
+    def _on_pitch_progress(self, frac: float) -> None:
+        self._shifting_frac = frac
+        self._update_pitch_label()
+
+    def _update_pitch_label(self) -> None:
+        text = self._pitch_base
+        if self._shifting:
+            text += f" · 生成{int(self._shifting_frac * 100)}%"
+        self._pitch_label.setText(text)
 
     def _on_status_message(self, message: str) -> None:
         if message:
@@ -258,5 +280,6 @@ class PlayerWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._bridge is not None:
             self._controller.detach_video_callbacks()
+        self._controller.shutdown_shift()
         self._controller.stop()
         super().closeEvent(event)

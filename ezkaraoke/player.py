@@ -8,9 +8,12 @@ becomes a no-op and ``status_message`` is emitted once.
 from __future__ import annotations
 
 import ctypes
+import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
+from ezkaraoke import pitchshift
 from ezkaraoke.library import Song
 
 _NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启 (sudo apt install vlc)"
@@ -34,6 +37,50 @@ def _detect_pitch_fn(vlc_module):
     return None
 
 
+class _ShiftSignals(QObject):
+    """Thread-safe signal bridge for the pitch-shift worker thread."""
+
+    finished = Signal(str, int)  # source path, semitones
+    progress = Signal(float)     # 0.0 .. 1.0
+    failed = Signal(str, int)    # source path, semitones
+
+
+class _PitchShiftWorker(threading.Thread):
+    """Background rubberband shift; signals report the outcome."""
+
+    def __init__(self, source: str, semitones: int, dest: Path,
+                 signals: _ShiftSignals) -> None:
+        super().__init__(daemon=True)
+        self.source = source
+        self.semitones = semitones
+        self.dest = dest
+        self.signals = signals
+        self._cancel = threading.Event()
+
+    def stop(self) -> None:
+        """Cancel after the current ffmpeg step (kills the subprocess)."""
+        self._cancel.set()
+
+    def wait(self, ms: int = 5000) -> bool:  # noqa: A003 - QThread-compatible
+        self.join(ms / 1000.0)
+        return not self.is_alive()
+
+    def run(self) -> None:
+        ok = pitchshift.shift_audio(
+            self.source,
+            self.dest,
+            self.semitones,
+            progress_cb=self.signals.progress.emit,
+            cancel_event=self._cancel,
+        )
+        if self._cancel.is_set():
+            return
+        if ok:
+            self.signals.finished.emit(self.source, self.semitones)
+        else:
+            self.signals.failed.emit(self.source, self.semitones)
+
+
 class PlayerController(QObject):
     current_changed = Signal(int)    # index of current song in queue, -1 if none
     queue_changed = Signal()         # membership or order changed
@@ -41,6 +88,8 @@ class PlayerController(QObject):
     status_message = Signal(str)     # warnings, e.g. missing libvlc
     audio_track_changed = Signal(int)  # active track index (0=原唱, 1=伴奏)
     pitch_changed = Signal(int)        # semitones, 0 = 原调
+    pitch_status = Signal(str)         # "" idle | "shifting" generating variant
+    pitch_progress = Signal(float)     # 0.0 .. 1.0 while shifting
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -57,6 +106,8 @@ class PlayerController(QObject):
         self._warned_no_vlc = False
         self._advancing = False  # re-entrancy guard for EndReached handling
         self._audio_track_index = 0  # preferred track, persists across songs
+        self._shift_worker: _PitchShiftWorker | None = None
+        self._active_path: str | None = None  # file currently loaded in VLC
 
     # ------------------------------------------------------------------ state
     @property
@@ -92,7 +143,7 @@ class PlayerController(QObject):
     @property
     def pitch_is_pure(self) -> bool:
         """True when a real pitch shift (no tempo change) is available."""
-        return self._pitch_fn is not None
+        return self._pitch_fn is not None or pitchshift.shift_available()
 
     # ------------------------------------------------------------------- vlc
     def _ensure_vlc(self) -> bool:
@@ -152,16 +203,32 @@ class PlayerController(QObject):
         if not self._ensure_vlc():
             return
         song = self._queue[self._current_index]
+        path, needs_shift = self._resolve_play_path(song.path)
         try:
             self._player.stop()
-            self._current_media = self._vlc.media_new(song.path)
+            self._current_media = self._vlc.media_new(path)
             self._player.set_media(self._current_media)
             self._player.play()
+            self._active_path = path
             QTimer.singleShot(0, lambda: self._sync_audio_track(0))
             # VLC resets rate/pitch per new media; reapply the preferred pitch.
             self._apply_pitch()
+            if needs_shift:
+                self._request_shift(song.path)
         except Exception as e:  # noqa: BLE001 - playback failure is a warning
             self.status_message.emit(str(e))
+
+    def _resolve_play_path(self, source: str) -> tuple[str, bool]:
+        """(file to play now, shifted variant still needed?)
+
+        A ready cache variant is played directly; otherwise the original is
+        played immediately and a background shift fills the cache.
+        """
+        if self._pitch_semitones != 0 and pitchshift.shift_available():
+            cache = pitchshift.shifted_file_path(source, self._pitch_semitones)
+            if cache.exists() and cache.stat().st_size > 0:
+                return str(cache), False
+        return source, self._pitch_semitones != 0 and pitchshift.shift_available()
 
     def _stop_vlc(self) -> None:
         if self._player is not None:
@@ -440,11 +507,31 @@ class PlayerController(QObject):
     def change_pitch(self, delta: int) -> None:
         self.set_pitch(self._pitch_semitones + delta)
 
+    def shutdown_shift(self) -> None:
+        """Cancel a running pitch-shift job (window close / app exit)."""
+        if self._shift_worker is not None:
+            self._shift_worker.stop()
+
     def _apply_pitch(self) -> None:
+        """Make the loaded media match the preferred pitch.
+
+        Priority: real libvlc pitch API > offline rubberband variant
+        (original plays first, hot-swapped when the variant is ready) >
+        tape speed (pitch AND tempo shift, last resort).
+        """
         player = self._player
         if player is None:
             return
         semis = self._pitch_semitones
+        song = self.current_song
+        if semis == 0:
+            if (
+                song is not None
+                and self._active_path is not None
+                and self._active_path != song.path
+            ):
+                self._swap_to(song.path)  # back from a shifted variant
+            return
         if self._pitch_fn is not None:
             try:
                 # player._as_parameter_ is the python-vlc _Ctype ctypes
@@ -456,11 +543,85 @@ class PlayerController(QObject):
                 return
             except Exception:  # noqa: BLE001
                 pass
-        # VLC < 4 fallback: tape speed — pitch AND tempo shift together
+        if song is not None and pitchshift.shift_available():
+            cache = pitchshift.shifted_file_path(song.path, semis)
+            if cache.exists() and cache.stat().st_size > 0:
+                if self._active_path != str(cache):
+                    self._swap_to(str(cache))
+            elif self._active_path == song.path:
+                self._request_shift(song.path)
+            return
+        # Last resort: tape speed — pitch AND tempo shift together
         try:
             player.set_rate(2.0 ** (semis / 12.0))
         except Exception:  # noqa: BLE001
             pass
+
+    def _request_shift(self, source: str) -> None:
+        """Start (or reuse) a background shift of *source* to the current pitch."""
+        semis = self._pitch_semitones
+        if semis == 0:
+            return
+        cache = pitchshift.shifted_file_path(source, semis)
+        if cache.exists() and cache.stat().st_size > 0:
+            return
+        worker = self._shift_worker
+        if (
+            worker is not None
+            and worker.is_alive()
+            and worker.source == source
+            and worker.semitones == semis
+        ):
+            return
+        if worker is not None:
+            worker.stop()  # superseded by a new pitch choice
+        pitchshift.warm_cache()
+        signals = _ShiftSignals()
+        signals.finished.connect(self._on_shift_finished)
+        signals.progress.connect(self.pitch_progress)
+        signals.failed.connect(self._on_shift_failed)
+        worker = _PitchShiftWorker(source, semis, cache, signals)
+        self._shift_worker = worker
+        worker.start()
+        self.pitch_status.emit("shifting")
+
+    def _on_shift_finished(self, source: str, semis: int) -> None:
+        self._shift_worker = None
+        self.pitch_status.emit("")
+        pitchshift.prune_cache()
+        song = self.current_song
+        if song is None or song.path != source or self._pitch_semitones != semis:
+            return  # user moved on: the file is cached for next time
+        cache = pitchshift.shifted_file_path(source, semis)
+        if self._player is not None and self._active_path == source:
+            self._swap_to(str(cache))
+
+    def _on_shift_failed(self, source: str, semis: int) -> None:
+        self._shift_worker = None
+        self.pitch_status.emit("")
+        if self.current_song is not None and self.current_song.path == source:
+            self.status_message.emit("变调生成失败（ffmpeg），保持原曲播放")
+
+    def _swap_to(self, path: str) -> None:
+        """Hot-swap the loaded media to *path*, preserving position + track."""
+        player = self._player
+        if player is None or self._vlc is None:
+            return
+        try:
+            position = player.get_time()
+        except Exception:  # noqa: BLE001
+            position = -1
+        try:
+            player.stop()
+            self._current_media = self._vlc.media_new(path)
+            player.set_media(self._current_media)
+            player.play()
+            if position > 0:
+                player.set_time(position)
+            self._active_path = path
+            QTimer.singleShot(0, lambda: self._sync_audio_track(0))
+        except Exception as e:  # noqa: BLE001 - keep the old media playing
+            self.status_message.emit(str(e))
 
     def attach_video_callbacks(self, lock_cb, unlock_cb, setup_cb, cleanup_cb) -> bool:
         """Register custom video output callbacks (software rendering).

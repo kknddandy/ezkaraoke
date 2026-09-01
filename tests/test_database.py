@@ -108,3 +108,61 @@ def test_avatar_lifecycle(tmp_path):
     assert "林俊杰" not in db.artists_without_avatar()
     assert db.get_avatar("林俊杰") is None  # tried, but no avatar stored
     db.close()
+
+
+def test_failed_avatar_is_retried_after_window(tmp_path):
+    import time
+
+    from ezkaraoke.database import AVATAR_RETRY_SECONDS
+
+    db = make_db(tmp_path)
+    db.rebuild([Song("周传雄", "星空", "/m/zcx.mp4")])
+    db.mark_avatar_tried("周传雄")
+    assert db.artists_without_avatar() == []  # within the retry window
+    db._conn.execute(
+        "UPDATE artists SET avatar_tried_at = ? WHERE name = '周传雄'",
+        (time.time() - AVATAR_RETRY_SECONDS - 60,),
+    )
+    db._conn.commit()
+    assert db.artists_without_avatar() == ["周传雄"]
+    db.close()
+
+
+def test_old_db_missing_retry_column_is_migrated(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE artists (name TEXT PRIMARY KEY, avatar BLOB, "
+        "avatar_tried INTEGER NOT NULL DEFAULT 0);"
+        "INSERT INTO artists (name) VALUES ('老歌手');"
+    )
+    conn.commit()
+    conn.close()
+    db = SongDatabase(path)
+    cols = {r[1] for r in db._conn.execute("PRAGMA table_info(artists)")}
+    assert "avatar_tried_at" in cols
+    assert db.artists() == ["老歌手"]
+    db.close()
+
+
+def test_delete_song_removes_row_and_orphan_artist(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(
+        [
+            Song("甲", "歌一", "/m/jia-1.mp4"),
+            Song("甲", "歌二", "/m/jia-2.mp4"),
+            Song("乙", "歌三", "/m/yi-3.mp4"),
+        ]
+    )
+    db.delete_song("/m/jia-1.mp4")
+    assert db.song_count() == 2
+    assert "甲" in db.artists()  # still has 歌二
+    db.delete_song("/m/jia-2.mp4")
+    assert db.song_count() == 1
+    assert db.artists() == ["乙"]  # 甲 dropped with its last song
+    # deleting a missing path is a no-op
+    db.delete_song("/m/never.mp4")
+    assert db.song_count() == 1
+    db.close()

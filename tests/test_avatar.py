@@ -45,6 +45,14 @@ def make_fake_http(responses: dict):
     return fake
 
 
+def stub_search_offline(monkeypatch):
+    """Keep the Bing fallback from touching the real network."""
+    monkeypatch.setattr(
+        avatar_mod, "_browser_get",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")),
+    )
+
+
 def test_wiki_hit_returns_image_bytes(monkeypatch):
     monkeypatch.setattr(
         avatar_mod,
@@ -70,6 +78,7 @@ def test_wiki_failure_falls_back_to_baike(monkeypatch):
 
 
 def test_all_providers_fail_returns_none(monkeypatch):
+    stub_search_offline(monkeypatch)
     monkeypatch.setattr(
         avatar_mod,
         "_http_get",
@@ -84,6 +93,7 @@ def test_all_providers_fail_returns_none(monkeypatch):
 
 
 def test_non_image_payload_rejected(monkeypatch):
+    stub_search_offline(monkeypatch)
     payload = b"<html>error</html>" + b" " * 200  # >100 bytes, no image magic
     monkeypatch.setattr(
         avatar_mod,
@@ -94,6 +104,7 @@ def test_non_image_payload_rejected(monkeypatch):
 
 
 def test_small_payload_rejected(monkeypatch):
+    stub_search_offline(monkeypatch)
     monkeypatch.setattr(
         avatar_mod,
         "_http_get",
@@ -105,6 +116,7 @@ def test_small_payload_rejected(monkeypatch):
 
 
 def test_baike_key_mismatch_rejected(monkeypatch):
+    stub_search_offline(monkeypatch)
     mismatched = '{"key":"别人","image":"http://bkimg/fake.jpg"}'.encode("utf-8")
     monkeypatch.setattr(
         avatar_mod,
@@ -118,6 +130,78 @@ def test_baike_key_mismatch_rejected(monkeypatch):
         ),
     )
     assert avatar_mod.fetch_artist_avatar("周杰伦") is None
+
+
+def test_search_query_cjk_and_ascii():
+    assert avatar_mod._search_query("周传雄") == "歌手 周传雄"
+    assert avatar_mod._search_query("Coldplay") == "Coldplay singer"
+
+
+BING_PAGE = (
+    b'<a m="{&quot;turl&quot;:&quot;http://t/1.jpg&quot;,'
+    b'&quot;murl&quot;:&quot;http://cdn/cand1.jpg&quot;}"></a>'
+    b'<a m="{&quot;turl&quot;:&quot;http://t/2.jpg&quot;,'
+    b'&quot;murl&quot;:&quot;http://cdn/cand2.jpg&quot;}"></a>'
+)
+
+
+def _jpeg(width: int, height: int, noisy: bool = False) -> bytes:
+    """Solid JPEGs compress below the 5KB minimum, so *noisy* fills random RGB."""
+    import io
+    import os
+
+    from PIL import Image
+
+    if noisy:
+        img = Image.frombuffer("RGB", (width, height), os.urandom(width * height * 3))
+    else:
+        img = Image.new("RGB", (width, height), (120, 60, 200))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    return buf.getvalue()
+
+
+def test_bing_image_urls_parsing(monkeypatch):
+    monkeypatch.setattr(
+        avatar_mod, "_browser_get",
+        lambda url, referer=None, timeout=10: BING_PAGE,
+    )
+    assert avatar_mod._bing_image_urls("周传雄") == [
+        "http://cdn/cand1.jpg", "http://cdn/cand2.jpg",
+    ]
+
+
+def test_full_chain_falls_back_to_search(monkeypatch):
+    """wiki 429 + baike down -> Bing candidate that is a real photo wins."""
+    small = _jpeg(100, 100, noisy=True)      # >5KB but below the minimum edge
+    good = _jpeg(300, 300, noisy=True)       # real photo-sized
+    monkeypatch.setattr(
+        avatar_mod,
+        "_http_get",
+        make_fake_http(
+            {
+                "zh.wikipedia.org": urllib.error.HTTPError(
+                    "x", 429, "Too Many Requests", None, None
+                ),
+                "baike.baidu.com": urllib.error.URLError("boom"),
+            }
+        ),
+    )
+    seen: list[str] = []
+
+    def fake_browser(url, referer=None, timeout=10):
+        seen.append(url)
+        if "bing.com" in url:
+            return BING_PAGE
+        if "cand1" in url:
+            return small
+        if "cand2" in url:
+            return good
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr(avatar_mod, "_browser_get", fake_browser)
+    assert avatar_mod.fetch_artist_avatar("周传雄") == good
+    assert any("cand2" in u for u in seen)
 
 
 def test_worker_emits_per_name_and_finishes(qapp, monkeypatch):
@@ -164,3 +248,85 @@ def test_worker_progress_signal(qapp, monkeypatch):
     for _ in range(100):
         qapp.processEvents()
     assert progress == [(1, 3), (2, 3), (3, 3)]
+
+
+# ------------------------------------------------------------------ PNG iCCP
+def _png_chunk(ctype: bytes, data: bytes) -> bytes:
+    import struct
+    import zlib
+
+    return (
+        struct.pack(">I", len(data))
+        + ctype
+        + data
+        + struct.pack(">I", zlib.crc32(ctype + data) & 0xFFFFFFFF)
+    )
+
+
+def _png_with_iccp() -> bytes:
+    """Minimal 1x1 RGB PNG carrying a (fake) iCCP chunk and a gAMA chunk."""
+    import struct
+    import zlib
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x12\x34\x56")
+    iccp = b"sRGB\x00\x00" + zlib.compress(b"fake-icc-profile-payload")
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"iCCP", iccp)
+        + _png_chunk(b"gAMA", struct.pack(">I", 45455))
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _chunk_types(data: bytes) -> list[bytes]:
+    import struct
+
+    types, i = [], 8
+    while i + 8 <= len(data):
+        length = struct.unpack(">I", data[i : i + 4])[0]
+        types.append(data[i + 4 : i + 8])
+        i += 12 + length
+    return types
+
+
+def test_strip_png_iccp_removes_only_iccp():
+    png = _png_with_iccp()
+    stripped = avatar_mod.strip_png_iccp(png)
+    assert _chunk_types(stripped) == [b"IHDR", b"gAMA", b"IDAT", b"IEND"]
+    assert stripped != png
+
+
+def test_strip_png_iccp_decodes_to_same_pixels():
+    import io
+
+    from PIL import Image
+
+    png = _png_with_iccp()
+    before = Image.open(io.BytesIO(png))
+    after = Image.open(io.BytesIO(avatar_mod.strip_png_iccp(png)))
+    assert before.tobytes() == after.tobytes()
+
+
+def test_strip_png_iccp_passthrough_without_iccp():
+    import struct
+    import zlib
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x12\x34\x56")
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+    assert avatar_mod.strip_png_iccp(png) == png
+
+
+def test_strip_png_iccp_non_png_and_truncated_unchanged():
+    jpeg = b"\xff\xd8\xff\xe0" + b"junk" * 10
+    assert avatar_mod.strip_png_iccp(jpeg) == jpeg
+    png = _png_with_iccp()
+    assert avatar_mod.strip_png_iccp(png[:20]) == png[:20]

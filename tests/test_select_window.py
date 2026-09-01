@@ -8,7 +8,8 @@ import time
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from ezkaraoke import avatar as avatar_mod
 from ezkaraoke.config import Config
@@ -70,13 +71,74 @@ def test_default_state(win):
 
 
 def test_select_artist_filters_table(win):
-    item = win._artist_list.item(1)  # artists are sorted; 周杰伦 first after 全部
+    # artists are pinyin-sorted: 邓紫棋 (d) < 林俊杰 (l) < 周杰伦 (z)
+    assert [win._artist_list.item(i).data(Qt.UserRole) for i in range(1, 4)] == [
+        "邓紫棋", "林俊杰", "周杰伦",
+    ]
+    item = win._artist_list.item(3)
     assert item.data(Qt.UserRole) == "周杰伦"
     win._artist_list.setCurrentItem(item)
     assert win._current_artist == "周杰伦"
     assert win._song_table.rowCount() == 4
     win._artist_list.setCurrentItem(win._artist_list.item(0))  # back to 全部
     assert win._song_table.rowCount() == 10
+
+
+def test_placeholder_label_shows_pinyin_letter(qapp):
+    from ezkaraoke.select_window import make_placeholder_pixmap, placeholder_label
+
+    assert placeholder_label("丁丁") == "中D-丁"
+    assert placeholder_label("阿东") == "中A-阿"
+    # 整串消歧：长春虫子 -> ch，不能按单字"长"取 zh
+    assert placeholder_label("长春虫子") == "中C-长"
+    assert placeholder_label("Coldplay") == "C"
+    icon = QIcon(make_placeholder_pixmap("丁丁", size=112))
+    assert not icon.isNull()
+
+
+def test_avatar_pixmap_label_always_drawn(qapp):
+    import io
+
+    from PIL import Image
+
+    from ezkaraoke.select_window import avatar_pixmap
+
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), (255, 0, 0)).save(buf, "PNG")
+    red = buf.getvalue()
+
+    with_photo = avatar_pixmap("丁丁", red, size=64)
+    assert not with_photo.isNull()
+    px = with_photo.toImage().pixelColor(8, 8)
+    assert px.red() > 200  # photo shows through behind the label
+
+    without = avatar_pixmap("丁丁", None, size=64)
+    assert not without.isNull()
+    px2 = without.toImage().pixelColor(8, 8)
+    assert abs(px2.red() - 0x2A) < 12 and abs(px2.blue() - 0x3E) < 12  # placeholder bg
+
+
+def test_artist_list_pinyin_order_a_before_c(qapp, tmp_path):
+    """回归：阿东 (a) 必须排在 长春虫子 (ch) 前面（不能按 Unicode 码位序）。"""
+    songs = [
+        Song("长春虫子", "歌一", "/music/长春虫子-歌一.mp4"),
+        Song("阿东", "歌二", "/music/阿东-歌二.mp4"),
+        Song("周杰伦", "歌三", "/music/周杰伦-歌三.mp4"),
+    ]
+    db = SongDatabase(tmp_path / "pinyin.db")
+    db.rebuild(songs)
+    for name in db.artists():
+        db.mark_avatar_tried(name)
+    window = SelectWindow(PlayerController(), db, Config(music_folder=""))
+    window.show()
+    qapp.processEvents()
+    try:
+        order = [window._artist_list.item(i).data(Qt.UserRole)
+                 for i in range(1, window._artist_list.count())]
+        assert order == ["阿东", "长春虫子", "周杰伦"]
+    finally:
+        window.close()
+        db.close()
 
 
 def test_letter_mode(win):
@@ -264,3 +326,135 @@ def test_avatar_progress_bar_states(qapp, tmp_path, monkeypatch):
     window.close()
     qapp.processEvents()
     db.close()
+
+
+def _menu_delete_setup(win, monkeypatch, answer):
+    """Make the context menu pick 永久删除 and the dialog answer *answer*.
+
+    PySide6 C++ classes ignore class-level attribute assignment, so the
+    module-level QMenu/QMessageBox references are patched instead.
+    """
+    import types
+
+    from ezkaraoke import select_window as sw
+
+    class FakeMenu(QMenu):
+        def exec(self, *a, **k):  # noqa: A003
+            return self.actions()[0]
+
+    fake_box = types.SimpleNamespace(
+        question=lambda *a, **k: answer,
+        StandardButton=QMessageBox.StandardButton,
+    )
+    monkeypatch.setattr(sw, "QMenu", FakeMenu)
+    monkeypatch.setattr(sw, "QMessageBox", fake_box)
+
+
+def _row_center(win, title: str):
+    from PySide6.QtCore import QPoint
+
+    table = win._song_table
+    for r in range(table.rowCount()):
+        if table.item(r, 1) is not None and table.item(r, 1).text() == title:
+            return QPoint(table.visualItemRect(table.item(r, 1)).center())
+    raise AssertionError(f"no row with title {title}")
+
+
+def test_context_menu_permanent_delete(qapp, tmp_path, monkeypatch):
+    media = tmp_path / "media"
+    media.mkdir()
+    f1 = media / "周杰伦-晴天.mp4"
+    f1.write_bytes(b"video-data")
+    f2 = media / "邓紫棋-泡沫.mp4"
+    f2.write_bytes(b"video-data")
+    songs = [Song("周杰伦", "晴天", str(f1)), Song("邓紫棋", "泡沫", str(f2))]
+    db = SongDatabase(tmp_path / "songs.db")
+    db.rebuild(songs)
+    for name in db.artists():
+        db.mark_avatar_tried(name)
+    controller = PlayerController()
+    controller.append(songs[0])  # 晴天 is also queued
+    window = SelectWindow(controller, db, Config(music_folder=""))
+    window.show()
+    qapp.processEvents()
+    try:
+        from ezkaraoke import select_window as sw
+
+        removed_cache_calls = []
+        monkeypatch.setattr(
+            sw, "remove_cached_for", removed_cache_calls.append
+        )
+        _menu_delete_setup(window, monkeypatch, QMessageBox.StandardButton.Yes)
+        window._on_song_context_menu(_row_center(window, "晴天"))
+        qapp.processEvents()
+        assert not f1.exists()          # file removed from disk
+        assert f2.exists()
+        assert window._db.song_count() == 1
+        assert window._db.artists() == ["邓紫棋"]
+        assert len(controller.queue) == 0  # queued copy removed
+        assert window._song_table.rowCount() == 1
+        assert "1 首" in window._status_left.text()
+        assert removed_cache_calls == [str(f1)]
+    finally:
+        window.close()
+        qapp.processEvents()
+        db.close()
+
+
+def test_context_menu_delete_declined_keeps_everything(qapp, tmp_path, monkeypatch):
+    media = tmp_path / "media"
+    media.mkdir()
+    f1 = media / "song.mp4"
+    f1.write_bytes(b"x")
+    song = Song("某人", "某歌", str(f1))
+    db = SongDatabase(tmp_path / "songs.db")
+    db.rebuild([song])
+    for name in db.artists():
+        db.mark_avatar_tried(name)
+    window = SelectWindow(PlayerController(), db, Config(music_folder=""))
+    window.show()
+    qapp.processEvents()
+    try:
+        _menu_delete_setup(window, monkeypatch, QMessageBox.StandardButton.No)
+        window._on_song_context_menu(_row_center(window, "某歌"))
+        qapp.processEvents()
+        assert f1.exists()
+        assert window._db.song_count() == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+        db.close()
+
+
+def test_context_menu_delete_current_song_stops_playback(qapp, tmp_path, monkeypatch):
+    media = tmp_path / "media"
+    media.mkdir()
+    f1 = media / "now.mp4"
+    f1.write_bytes(b"x")
+    f2 = media / "next.mp4"
+    f2.write_bytes(b"y")
+    s1 = Song("歌手", "正在播", str(f1))
+    s2 = Song("歌手", "下一首", str(f2))
+    db = SongDatabase(tmp_path / "songs.db")
+    db.rebuild([s1, s2])
+    for name in db.artists():
+        db.mark_avatar_tried(name)
+    controller = PlayerController()
+    controller._queue = [s1, s2]  # pretend 正在播 is current (no VLC needed)
+    controller._current_index = 0
+    assert controller.current_song is not None
+    window = SelectWindow(controller, db, Config(music_folder=""))
+    window.show()
+    qapp.processEvents()
+    try:
+        _menu_delete_setup(window, monkeypatch, QMessageBox.StandardButton.Yes)
+        window._on_song_context_menu(_row_center(window, "正在播"))
+        qapp.processEvents()
+        assert not f1.exists()
+        assert controller.current_index == -1        # playback stopped
+        assert controller.queue == [s2]             # next song survives
+        assert window._db.song_count() == 1
+    finally:
+        window.close()
+        qapp.processEvents()
+        db.close()

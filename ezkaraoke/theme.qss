@@ -235,15 +235,15 @@ QTreeWidget::branch:open:has-children:has-siblings {
 }
 
 /* ===== List Widget (artist / letter indexes) ===== */
-/* Large text + 56px avatar icons: meant to be read from across the room. */
-QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; font-size: 18px; }
-QListWidget::item { padding: 10px 12px; border-bottom: 1px solid #141420; }
+/* Oversized text + 112px avatar icons: meant to be read from across the room. */
+QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; font-size: 36px; }
+QListWidget::item { padding: 20px 24px; border-bottom: 1px solid #141420; }
 QListWidget::item:selected { background-color: rgba(232, 160, 48, 0.25); color: #ececec; }
 QListWidget::item:hover { background-color: rgba(232, 160, 48, 0.12); }
 QListWidget::item:disabled { color: #555566; }
 
 /* Mode toggle buttons */
-QPushButton#ModeButton { padding: 6px 12px; font-size: 13px; }
+QPushButton#ModeButton { padding: 10px 12px; font-size: 18px; }
 QPushButton#ModeButton:checked { background-color: #e8a030; color: #0c0c14; border-color: #e8a030; font-weight: bold; }
 
 /* Pitch label in player control bar */

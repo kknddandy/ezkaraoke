@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 from pathlib import Path
 
 from ezkaraoke.letters import LETTERS, compute_letter
 from ezkaraoke.library import Song
 
 DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "ezkaraoke" / "songs.db"
+AVATAR_RETRY_SECONDS = 86400  # failed avatar fetches may be retried after this
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS songs (
@@ -22,7 +24,8 @@ CREATE INDEX IF NOT EXISTS idx_songs_letter ON songs(letter);
 CREATE TABLE IF NOT EXISTS artists (
     name TEXT PRIMARY KEY,
     avatar BLOB,
-    avatar_tried INTEGER NOT NULL DEFAULT 0
+    avatar_tried INTEGER NOT NULL DEFAULT 0,
+    avatar_tried_at REAL
 );
 """
 
@@ -38,6 +41,10 @@ class SongDatabase:
         self._conn = sqlite3.connect(str(self.path))
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(SCHEMA)
+        # Migrate pre-0.2 databases that lack the retry timestamp.
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(artists)")}
+        if "avatar_tried_at" not in cols:
+            self._conn.execute("ALTER TABLE artists ADD COLUMN avatar_tried_at REAL")
         self._conn.commit()
 
     def rebuild(self, songs: list[Song]) -> None:
@@ -59,6 +66,15 @@ class SongDatabase:
             self._conn.execute(
                 "INSERT OR IGNORE INTO artists (name) "
                 "SELECT DISTINCT artist FROM songs"
+            )
+
+    def delete_song(self, path: str) -> None:
+        """Remove one song; artists left without songs are dropped too."""
+        with self._conn:
+            self._conn.execute("DELETE FROM songs WHERE path = ?", (str(path),))
+            self._conn.execute(
+                "DELETE FROM artists WHERE name NOT IN "
+                "(SELECT DISTINCT artist FROM songs)"
             )
 
     def song_count(self) -> int:
@@ -132,25 +148,31 @@ class SongDatabase:
 
     def set_avatar(self, name: str, data: bytes) -> None:
         self._conn.execute(
-            "INSERT INTO artists (name, avatar, avatar_tried) VALUES (?, ?, 1) "
+            "INSERT INTO artists (name, avatar, avatar_tried, avatar_tried_at) "
+            "VALUES (?, ?, 1, ?) "
             "ON CONFLICT(name) DO UPDATE SET avatar = excluded.avatar, "
-            "avatar_tried = 1",
-            (name, data),
+            "avatar_tried = 1, avatar_tried_at = excluded.avatar_tried_at",
+            (name, data, time.time()),
         )
         self._conn.commit()
 
     def mark_avatar_tried(self, name: str) -> None:
         self._conn.execute(
-            "INSERT INTO artists (name, avatar_tried) VALUES (?, 1) "
-            "ON CONFLICT(name) DO UPDATE SET avatar_tried = 1",
-            (name,),
+            "INSERT INTO artists (name, avatar_tried, avatar_tried_at) VALUES (?, 1, ?) "
+            "ON CONFLICT(name) DO UPDATE SET avatar_tried = 1, "
+            "avatar_tried_at = excluded.avatar_tried_at",
+            (name, time.time()),
         )
         self._conn.commit()
 
     def artists_without_avatar(self) -> list[str]:
+        """Artists to fetch: never tried, or failed long enough ago to retry."""
+        cutoff = time.time() - AVATAR_RETRY_SECONDS
         rows = self._conn.execute(
-            "SELECT name FROM artists WHERE avatar IS NULL AND avatar_tried = 0 "
-            "ORDER BY name"
+            "SELECT name FROM artists WHERE avatar IS NULL "
+            "AND (avatar_tried = 0 OR COALESCE(avatar_tried_at, 0) < ?) "
+            "ORDER BY name",
+            (cutoff,),
         ).fetchall()
         return [r[0] for r in rows]
 

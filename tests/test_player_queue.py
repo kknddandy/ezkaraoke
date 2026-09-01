@@ -676,7 +676,11 @@ def test_pitch_uses_pitch_fn_when_available(qapp):
     assert p._player.rates == []  # fallback not used when pitch fn is available
 
 
-def test_pitch_reapplied_on_new_media(qapp):
+def test_pitch_reapplied_on_new_media(qapp, monkeypatch):
+    from ezkaraoke import pitchshift as ps
+
+    monkeypatch.setattr(ps, "shift_available", lambda: False)
+
     class FakeVlc:
         def media_new(self, path: str):
             return object()
@@ -689,3 +693,121 @@ def test_pitch_reapplied_on_new_media(qapp):
     # _start_vlc resets the player; the preferred pitch must be reapplied.
     # (the pending singleShot timer is harmless; do NOT run the event loop)
     assert p._player.rates[-1] == pytest.approx(2.0 ** (3 / 12))
+
+
+def test_pitch_fallback_without_ffmpeg_uses_rate(qapp, monkeypatch):
+    from ezkaraoke import pitchshift as ps
+
+    monkeypatch.setattr(ps, "shift_available", lambda: False)
+    p = PlayerController()
+    p._player = FakePlayer()
+    p.set_pitch(1)
+    assert p._player.rates == pytest.approx([2.0 ** (1 / 12)])
+
+
+def test_resolve_play_path_prefers_ready_cache(qapp, monkeypatch, tmp_path):
+    from ezkaraoke import pitchshift as ps
+
+    monkeypatch.setattr(ps, "shift_available", lambda: True)
+    monkeypatch.setattr(ps, "CACHE_DIR", tmp_path / "cache")
+    p = PlayerController()
+    p._pitch_semitones = 3
+    src = "/music/A-t.mp4"
+    cache = ps.shifted_file_path(src, 3)
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"variant")
+    path, needs = p._resolve_play_path(src)
+    assert path == str(cache)
+    assert needs is False
+    cache.unlink()
+    path, needs = p._resolve_play_path(src)
+    assert path == src
+    assert needs is True
+
+
+def test_resolve_play_path_original_at_semitones_zero(qapp):
+    p = PlayerController()
+    path, needs = p._resolve_play_path("/music/A-t.mp4")
+    assert path == "/music/A-t.mp4"
+    assert needs is False
+
+
+def test_apply_pitch_starts_shift_worker(qapp, monkeypatch, tmp_path):
+    import time
+
+    from ezkaraoke import pitchshift as ps
+
+    monkeypatch.setattr(ps, "shift_available", lambda: True)
+    monkeypatch.setattr(ps, "CACHE_DIR", tmp_path / "cache")
+    calls: list[tuple[str, "object", int]] = []
+
+    def fake_shift(src, dest, semis, progress_cb=None, cancel_event=None):
+        calls.append((src, dest, semis))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"variant")
+        return True
+
+    monkeypatch.setattr(ps, "shift_audio", fake_shift)
+
+    class FakeVlc:
+        def __init__(self):
+            self.media_paths: list[str] = []
+
+        def media_new(self, path: str):
+            self.media_paths.append(path)
+            return object()
+
+    p = PlayerController()
+    p._player = FakePlayer()
+    vlc = FakeVlc()
+    p._vlc = vlc
+    p.play_now(make("A", "t"))
+    assert vlc.media_paths == ["/music/A-t.mp4"]
+
+    statuses: list[str] = []
+    p.pitch_status.connect(statuses.append)
+    p.set_pitch(2)
+    assert statuses == ["shifting"]
+    worker = p._shift_worker
+    assert worker is not None
+    assert worker.wait(5000)
+    deadline = time.time() + 5
+    while p._shift_worker is not None and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert p._shift_worker is None
+    assert statuses == ["shifting", ""]
+    assert calls and calls[0][0] == "/music/A-t.mp4" and calls[0][2] == 2
+    # the finished variant is hot-swapped in (original was still playing)
+    assert vlc.media_paths[-1] == str(ps.shifted_file_path("/music/A-t.mp4", 2))
+    assert p._active_path == vlc.media_paths[-1]
+
+
+def test_shift_finished_ignored_when_song_moved_on(qapp, monkeypatch, tmp_path):
+    from ezkaraoke import pitchshift as ps
+
+    monkeypatch.setattr(ps, "shift_available", lambda: True)
+    monkeypatch.setattr(ps, "CACHE_DIR", tmp_path / "cache")
+    monkeypatch.setattr(ps, "shift_audio", lambda *a, **k: True)
+
+    class FakeVlc:
+        def __init__(self):
+            self.media_paths: list[str] = []
+
+        def media_new(self, path: str):
+            self.media_paths.append(path)
+            return object()
+
+    p = PlayerController()
+    p._player = FakePlayer()
+    vlc = FakeVlc()
+    p._vlc = vlc
+    p.play_now(make("A", "t"))
+    p.play_now(make("B", "u"))
+    src = "/music/A-t.mp4"
+    cache = ps.shifted_file_path(src, 2)
+    cache.parent.mkdir(parents=True)
+    cache.write_bytes(b"variant")
+    p._active_path = src
+    p._on_shift_finished(src, 2)  # late callback for the old song
+    assert vlc.media_paths[-1] == "/music/B-u.mp4"  # no swap happened

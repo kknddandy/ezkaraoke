@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ezkaraoke"
+dynamic = ["version"]
+description = "Local KTV karaoke player: scan a music folder, pick songs, play video through VLC"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "kknddandy", email = "kknddandy@users.noreply.github.com" }]
+keywords = ["karaoke", "ktv", "vlc", "music", "pyside6"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "PySide6>=6.6",
+    "python-vlc>=3.0.21000",
+    "pypinyin>=0.51",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "Pillow>=10",
+]
+
+[project.scripts]
+ezkaraoke = "ezkaraoke.main:main"
+
+[project.urls]
+Homepage = "https://github.com/kknddandy/ezkaraoke"
+Issues = "https://github.com/kknddandy/ezkaraoke/issues"
+
+[tool.setuptools]
+packages = ["ezkaraoke"]
+
+[tool.setuptools.package-data]
+ezkaraoke = ["theme.qss"]
+
+[tool.setuptools.dynamic]
+version = { attr = "ezkaraoke.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

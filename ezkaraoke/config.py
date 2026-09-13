@@ -13,6 +13,7 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / "ezkaraoke" / "config.json"
 class Config:
     music_folder: str = ""
     db_path: str = ""
+    language: str = "zh"
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -29,7 +30,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     db_path = data.get("db_path", "")
     if not isinstance(db_path, str):
         db_path = ""
-    return Config(music_folder=music_folder, db_path=db_path)
+    language = data.get("language", "zh")
+    if language not in ("zh", "en"):
+        language = "zh"
+    return Config(
+        music_folder=music_folder, db_path=db_path, language=language
+    )
 
 
 def save_config(cfg: Config, path: Path = DEFAULT_CONFIG_PATH) -> None:

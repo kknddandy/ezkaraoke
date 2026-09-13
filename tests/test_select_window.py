@@ -503,6 +503,79 @@ def test_append_to_playing_queue_does_not_restart(qapp, win):
     qapp.processEvents()
 
 
+# ------------------------------------------------------- queue table / 插歌
+def _select_song_row(win, title: str) -> None:
+    """Select the song table row whose title is *title* (order-agnostic)."""
+    table = win._song_table
+    for r in range(table.rowCount()):
+        item = table.item(r, 1)
+        if item is not None and item.text() == title:
+            table.selectRow(r)
+            return
+    raise AssertionError(f"no table row with title {title}")
+
+
+def test_queue_table_has_no_number_column(win):
+    # The 序号 column duplicated the vertical-header row numbers and is
+    # gone; the current song is marked with "▶ " in the title cell.
+    assert win._queue_table.columnCount() == 2
+    assert win._queue_table.horizontalHeaderItem(0).text() == "歌手"
+    assert win._queue_table.horizontalHeaderItem(1).text() == "歌名"
+
+
+def test_queue_current_song_marked_in_title(qapp, win):
+    _select_song_row(win, "晴天")
+    win._btn_append.click()  # auto-plays 晴天
+    qapp.processEvents()
+    assert win._queue_table.item(0, 1).text() == "▶ 晴天"
+    win._controller.stop()
+    qapp.processEvents()
+    assert win._queue_table.item(0, 1).text() == "晴天"
+
+
+def test_queue_insert_button_moves_selected_after_current(qapp, win):
+    c = win._controller
+    for title in ("晴天", "七里香", "稻香"):
+        _select_song_row(win, title)
+        win._btn_append.click()
+    qapp.processEvents()
+    assert [s.title for s in c.queue] == ["晴天", "七里香", "稻香"]
+    assert c.current_index == 0
+    # 插歌 button sits before 上移
+    assert win._btn_jump.text() == "插歌"
+    win._queue_table.selectRow(2)  # 稻香
+    win._btn_jump.click()
+    qapp.processEvents()
+    assert [s.title for s in c.queue] == ["晴天", "稻香", "七里香"]
+    assert c.current_index == 0
+    assert c.current_song is not None and c.current_song.title == "晴天"
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_queue_insert_button_multi_select_keeps_order(qapp, win):
+    c = win._controller
+    for title in ("晴天", "七里香", "稻香", "夜曲"):
+        _select_song_row(win, title)
+        win._btn_append.click()
+    qapp.processEvents()
+    assert [s.title for s in c.queue] == ["晴天", "七里香", "稻香", "夜曲"]
+    # select 七里香 (row 1) and 夜曲 (row 3) non-contiguously; 晴天 is current
+    from PySide6.QtCore import QItemSelectionModel
+
+    model = win._queue_table.model()
+    win._queue_table.selectRow(1)
+    win._queue_table.selectionModel().select(
+        model.index(3, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows
+    )
+    win._btn_jump.click()
+    qapp.processEvents()
+    assert [s.title for s in c.queue] == ["晴天", "七里香", "夜曲", "稻香"]
+    assert c.current_index == 0
+    win._controller.stop()
+    qapp.processEvents()
+
+
 def test_play_pause_button(qapp, win):
     c = win._controller
     assert win._btn_play.text() == "播放"

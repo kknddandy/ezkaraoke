@@ -412,6 +412,135 @@ def test_move_empty_queue_noop(qapp):
     assert p.queue == []
 
 
+# ------------------------------------------------------ jump_after_current
+def test_jump_after_current_single(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4 = make("A", "a1"), make("B", "b1"), make("C", "c1"), make("D", "d1")
+    for s in (s1, s2, s3, s4):
+        p.append(s)
+    p.play_at(1)  # current = s2 at index 1
+    p.jump_after_current([3])  # s4 jumps right after s2
+    assert paths(p.queue) == [s1.path, s2.path, s4.path, s3.path]
+    assert p.current_index == 1
+    assert p.current_song is s2
+
+
+def test_jump_after_current_multiple_preserves_selection_order(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4, s5 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"),
+        make("D", "d1"), make("E", "e1"),
+    )
+    for s in (s1, s2, s3, s4, s5):
+        p.append(s)
+    p.play_at(1)  # current = s2
+    # both s1 (before current) and s5 (after) jump behind s2, top-to-bottom
+    # selection order preserved: s1 then s5
+    p.jump_after_current([4, 0])
+    assert paths(p.queue) == [s2.path, s1.path, s5.path, s3.path, s4.path]
+    assert p.current_index == 0
+    assert p.current_song is s2
+
+
+def test_jump_after_current_skips_current_song(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    p.play_at(1)
+    changed: list[int] = []
+    p.current_changed.connect(changed.append)
+    p.jump_after_current([1, 2])  # current + s3
+    assert paths(p.queue) == [s1.path, s2.path, s3.path]
+    assert p.current_index == 1
+    assert p.current_song is s2
+    assert changed == []  # the current song never moves
+
+
+def test_jump_after_current_already_next_is_noop(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    p.play_at(0)
+    changed: list[int] = []
+    p.queue_changed.connect(lambda: changed.append(1))
+    p.jump_after_current([1])  # s2 already right after current
+    assert changed == []  # no spurious refresh signal
+    assert paths(p.queue) == [s1.path, s2.path, s3.path]
+
+
+def test_jump_after_current_nothing_playing_goes_to_front(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    p.jump_after_current([2])
+    assert paths(p.queue) == [s3.path, s1.path, s2.path]
+    assert p.current_index == -1
+
+
+def test_jump_after_current_current_at_end(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    p.play_at(2)  # current = s3, last
+    p.jump_after_current([0])  # s1 jumps past the current song; removing
+    # it before the current song shifts current_index 2 -> 1
+    assert paths(p.queue) == [s2.path, s3.path, s1.path]
+    assert p.current_index == 1
+    assert p.current_song is s3
+
+
+def test_jump_after_current_ignores_invalid_indices(qapp):
+    p = PlayerController()
+    s1, s2 = make("A", "a1"), make("B", "b1")
+    for s in (s1, s2):
+        p.append(s)
+    p.play_at(0)
+    p.jump_after_current([])
+    p.jump_after_current([99, -1])
+    assert paths(p.queue) == [s1.path, s2.path]
+    assert p.current_index == 0
+
+
+# -------------------------------------------------------------------- replay
+def test_replay_restarts_current(qapp):
+    p = PlayerController()
+    s1, s2 = make("A", "a1"), make("B", "b1")
+    p.append(s1)
+    p.append(s2)
+    p.play_at(1)
+    changed: list[int] = []
+    p.current_changed.connect(changed.append)
+    p.replay()
+    assert p.current_index == 1
+    assert p.current_song is s2
+    assert p.is_playing
+    assert changed == [1]
+    # the queue order is untouched
+    assert paths(p.queue) == [s1.path, s2.path]
+
+
+def test_replay_while_paused_resumes(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.play_at(0)
+    p.toggle_pause()
+    assert p.is_paused
+    p.replay()
+    assert p.is_playing
+
+
+def test_replay_from_stopped_noop(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.replay()
+    assert p.current_index == -1
+    assert not p.is_playing
+
+
 # ----------------------------------------------------------------------- stop
 def test_stop_keeps_queue(qapp):
     p = PlayerController()

@@ -3,6 +3,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
+from ezkaraoke import i18n
 from ezkaraoke.config import load_config
 from ezkaraoke.database import DEFAULT_DB_PATH, SongDatabase
 from ezkaraoke.player import PlayerController
@@ -19,6 +20,7 @@ def main() -> int:
         app.setStyleSheet(qss_path.read_text(encoding="utf-8"))
 
     config = load_config()
+    i18n.set_language(config.language)  # before any window builds its UI
     db = SongDatabase(Path(config.db_path) if config.db_path else DEFAULT_DB_PATH)
     controller = PlayerController()
 

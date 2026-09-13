@@ -128,6 +128,10 @@ class PlayerController(QObject):
         return None
 
     @property
+    def state(self) -> str:
+        return self._state
+
+    @property
     def is_playing(self) -> bool:
         return self._state == "playing"
 
@@ -398,6 +402,45 @@ class PlayerController(QObject):
         if self._current_index != old_current:
             self.current_changed.emit(self._current_index)
         self.queue_changed.emit()
+
+    def jump_after_current(self, indices: list[int]) -> None:
+        """Move the queue rows at *indices* right after the playing song.
+
+        The current song itself is skipped (it is already in front of the
+        insertion point); with nothing playing the songs go to the front.
+        The relative order of the moved songs is preserved, and no signals
+        are emitted when the order does not actually change.
+        """
+        if not self._queue:
+            return
+        valid = {i for i in indices if 0 <= i < len(self._queue)}
+        old_current = self._current_index
+        current_song = (
+            self._queue[old_current] if 0 <= old_current < len(self._queue) else None
+        )
+        drop = {i for i in valid if i != old_current}
+        moved = [self._queue[i] for i in sorted(drop)]
+        if not moved:
+            return
+        rest = [s for i, s in enumerate(self._queue) if i not in drop]
+        if current_song is not None:
+            cur_pos = next(i for i, s in enumerate(rest) if s is current_song)
+            target = cur_pos + 1
+        else:
+            cur_pos = -1
+            target = 0
+        new_queue = rest[:target] + moved + rest[target:]
+        if [s.path for s in new_queue] == [s.path for s in self._queue]:
+            return
+        self._queue = new_queue
+        self._current_index = cur_pos  # insertions land after it: unchanged
+        self.queue_changed.emit()
+
+    def replay(self) -> None:
+        """Restart the current song from the beginning."""
+        if not 0 <= self._current_index < len(self._queue):
+            return
+        self._begin_play(self._current_index)
 
     # --------------------------------------------------------- transport keys
     def toggle_pause(self) -> None:

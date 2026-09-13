@@ -33,9 +33,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ezkaraoke import i18n
 from ezkaraoke.avatar import AvatarWorker, strip_png_iccp
 from ezkaraoke.config import Config, save_config
 from ezkaraoke.database import SongDatabase
+from ezkaraoke.i18n import on_language_changed, off_language_changed, tr
 from ezkaraoke.letters import pinyin_key
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
@@ -177,7 +179,7 @@ class SelectWindow(QMainWindow):
         self._search_text: str = ""
         self._avatar_cache: dict[str, QPixmap] = {}
 
-        self.setWindowTitle("ezkaraoke · 点歌台")
+        self.setWindowTitle(tr("ezkaraoke · 点歌台"))
         self.resize(1280, 760)
 
         # Main splitter: left lists | center | right queue
@@ -195,7 +197,7 @@ class SelectWindow(QMainWindow):
         mode_layout.setContentsMargins(0, 0, 0, 0)
         mode_layout.setSpacing(6)
 
-        self._btn_mode_artist = QPushButton("歌手", self)
+        self._btn_mode_artist = QPushButton(tr("歌手"), self)
         self._btn_mode_artist.setObjectName("ModeButton")
         self._btn_mode_artist.setCheckable(True)
         self._btn_mode_artist.setChecked(True)
@@ -203,7 +205,7 @@ class SelectWindow(QMainWindow):
         self._btn_mode_artist.clicked.connect(lambda: self._set_mode("artist"))
         mode_layout.addWidget(self._btn_mode_artist)
 
-        self._btn_mode_letter = QPushButton("首字母", self)
+        self._btn_mode_letter = QPushButton(tr("首字母"), self)
         self._btn_mode_letter.setObjectName("ModeButton")
         self._btn_mode_letter.setCheckable(True)
         self._btn_mode_letter.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
@@ -250,18 +252,25 @@ class SelectWindow(QMainWindow):
         self._update_folder_label()
         toolbar_layout.addWidget(self._folder_label)
 
-        self._btn_choose = QPushButton("选择文件夹…", self)
+        self._btn_choose = QPushButton(tr("选择文件夹…"), self)
         self._btn_choose.setObjectName("ToolButton")
         self._btn_choose.clicked.connect(self._choose_folder)
         toolbar_layout.addWidget(self._btn_choose)
 
-        self._btn_rescan = QPushButton("重新扫描", self)
+        self._btn_rescan = QPushButton(tr("重新扫描"), self)
         self._btn_rescan.setObjectName("ToolButton")
         self._btn_rescan.clicked.connect(self._start_scan)
         toolbar_layout.addWidget(self._btn_rescan)
 
+        self._btn_lang = QPushButton(self)
+        self._btn_lang.setObjectName("ToolButton")
+        self._btn_lang.setToolTip("Switch UI language / 切换界面语言")
+        self._btn_lang.clicked.connect(self._toggle_language)
+        self._update_lang_button()
+        toolbar_layout.addWidget(self._btn_lang)
+
         self._search_edit = QLineEdit(self)
-        self._search_edit.setPlaceholderText("搜索歌手或歌名…")
+        self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.setMinimumWidth(200)
         self._search_edit.textChanged.connect(self._on_search_changed)
@@ -274,7 +283,7 @@ class SelectWindow(QMainWindow):
         self._song_table = QTableWidget(self)
         self._song_table.setObjectName("SongTable")
         self._song_table.setColumnCount(2)
-        self._song_table.setHorizontalHeaderLabels(["歌手", "歌名"])
+        self._song_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
         self._song_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
         self._song_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self._song_table.setColumnWidth(0, 260)
@@ -304,31 +313,31 @@ class SelectWindow(QMainWindow):
         action_layout.setContentsMargins(0, 0, 0, 0)
         action_layout.setSpacing(10)
 
-        self._btn_append = QPushButton("点歌", self)
+        self._btn_append = QPushButton(tr("点歌"), self)
         self._btn_append.setObjectName("AccentButton")
         self._btn_append.clicked.connect(self._append_selected)
         action_layout.addWidget(self._btn_append)
 
-        self._btn_insert = QPushButton("插入播放", self)
+        self._btn_insert = QPushButton(tr("插入播放"), self)
         self._btn_insert.setObjectName("ToolButton")
         self._btn_insert.clicked.connect(self._insert_selected)
         action_layout.addWidget(self._btn_insert)
 
-        self._btn_play_now = QPushButton("立即播放", self)
+        self._btn_play_now = QPushButton(tr("立即播放"), self)
         self._btn_play_now.setObjectName("ToolButton")
         self._btn_play_now.clicked.connect(self._play_now_selected)
         action_layout.addWidget(self._btn_play_now)
 
-        self._btn_play = QPushButton("播放", self)
+        self._btn_play = QPushButton(tr("播放"), self)
         self._btn_play.setObjectName("ToolButton")
         self._btn_play.clicked.connect(self._controller.toggle_pause)
         action_layout.addWidget(self._btn_play)
 
-        self._btn_track = QPushButton("原唱/伴奏", self)
+        self._btn_track = QPushButton(tr("原唱/伴奏"), self)
         self._btn_track.setObjectName("ToolButton")
         self._btn_track.setCheckable(True)
         self._btn_track.setEnabled(False)
-        self._btn_track.setToolTip("切换当前歌曲的音轨（原唱/伴奏）")
+        self._btn_track.setToolTip(tr("切换当前歌曲的音轨（原唱/伴奏）"))
         self._btn_track.clicked.connect(self._controller.toggle_audio_track)
         action_layout.addWidget(self._btn_track)
 
@@ -343,11 +352,13 @@ class SelectWindow(QMainWindow):
         right_layout.setContentsMargins(4, 8, 8, 8)
         right_layout.setSpacing(10)
 
+        # Row numbers stay on the vertical header; a separate 序号 column
+        # would repeat them. The current song is marked with "▶ " in the
+        # title cell.
         self._queue_table = QTableWidget(self)
-        self._queue_table.setColumnCount(3)
-        self._queue_table.setHorizontalHeaderLabels(["序号", "歌手", "歌名"])
+        self._queue_table.setColumnCount(2)
+        self._queue_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
         self._queue_table.horizontalHeader().setStretchLastSection(True)
-        self._queue_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self._queue_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._queue_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self._queue_table.setAlternatingRowColors(True)
@@ -360,17 +371,23 @@ class SelectWindow(QMainWindow):
         queue_bar_layout.setContentsMargins(0, 0, 0, 0)
         queue_bar_layout.setSpacing(8)
 
-        self._btn_up = QPushButton("上移", self)
+        self._btn_jump = QPushButton(tr("插歌"), self)
+        self._btn_jump.setObjectName("ToolButton")
+        self._btn_jump.setToolTip(tr("把选中的歌曲移到正在播放歌曲的下一首"))
+        self._btn_jump.clicked.connect(self._insert_after_current)
+        queue_bar_layout.addWidget(self._btn_jump)
+
+        self._btn_up = QPushButton(tr("上移"), self)
         self._btn_up.setObjectName("ToolButton")
         self._btn_up.clicked.connect(self._move_up)
         queue_bar_layout.addWidget(self._btn_up)
 
-        self._btn_down = QPushButton("下移", self)
+        self._btn_down = QPushButton(tr("下移"), self)
         self._btn_down.setObjectName("ToolButton")
         self._btn_down.clicked.connect(self._move_down)
         queue_bar_layout.addWidget(self._btn_down)
 
-        self._btn_remove = QPushButton("删除", self)
+        self._btn_remove = QPushButton(tr("删除"), self)
         self._btn_remove.setObjectName("ToolButton")
         self._btn_remove.clicked.connect(self._remove_selected)
         queue_bar_layout.addWidget(self._btn_remove)
@@ -412,16 +429,72 @@ class SelectWindow(QMainWindow):
         self._update_button_states()
 
         if self._db.song_count() > 0:
-            self._status_left.setText(f"共 {self._db.song_count()} 首（本地数据库）")
+            self._update_status_summary()
             self._start_avatar_worker()
         elif self._config.music_folder:
             folder = Path(self._config.music_folder)
             if folder.exists() and folder.is_dir():
                 self._start_scan()
             else:
-                self._status_left.setText("文件夹不存在")
+                self._status_left.setText(tr("文件夹不存在"))
         else:
-            self._status_left.setText("请设置音乐文件夹")
+            self._status_left.setText(tr("请设置音乐文件夹"))
+
+        # Re-translate every label when the language changes.
+        on_language_changed(self.retranslate)
+
+    # ===== Language =====
+
+    def _update_lang_button(self) -> None:
+        # The button always offers the *other* language.
+        self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
+
+    def _toggle_language(self) -> None:
+        new = "en" if i18n.current_language() == "zh" else "zh"
+        self._config.language = new
+        save_config(self._config)
+        i18n.set_language(new)  # notifies both windows -> retranslate()
+
+    def retranslate(self) -> None:
+        """Re-apply the active language to every label, header and tooltip."""
+        self.setWindowTitle(tr("ezkaraoke · 点歌台"))
+        self._btn_mode_artist.setText(tr("歌手"))
+        self._btn_mode_letter.setText(tr("首字母"))
+        self._btn_choose.setText(tr("选择文件夹…"))
+        self._btn_rescan.setText(tr("重新扫描"))
+        self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
+        self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
+        self._song_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
+        self._btn_append.setText(tr("点歌"))
+        self._btn_insert.setText(tr("插入播放"))
+        self._btn_play_now.setText(tr("立即播放"))
+        self._btn_play.setText(tr("暂停") if self._controller.is_playing else tr("播放"))
+        self._btn_track.setText(tr("原唱/伴奏"))
+        self._queue_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
+        self._btn_jump.setText(tr("插歌"))
+        self._btn_jump.setToolTip(tr("把选中的歌曲移到正在播放歌曲的下一首"))
+        self._btn_up.setText(tr("上移"))
+        self._btn_down.setText(tr("下移"))
+        self._btn_remove.setText(tr("删除"))
+        self._update_folder_label()
+        self._on_audio_track(self._controller.audio_track_index)
+        self._update_status_summary()
+        self._highlight_current_queue()
+        for lst in (self._artist_list, self._letter_list):
+            if lst.count() > 0:
+                lst.item(0).setText(tr("全部 ({count})", count=self._db.song_count()))
+
+    def _update_status_summary(self) -> None:
+        if self._db.song_count() > 0:
+            self._status_left.setText(
+                tr("共 {count} 首（本地数据库）", count=self._db.song_count())
+            )
+        elif self._config.music_folder and Path(self._config.music_folder).is_dir():
+            self._status_left.setText("")
+        elif self._config.music_folder:
+            self._status_left.setText(tr("文件夹不存在"))
+        else:
+            self._status_left.setText(tr("请设置音乐文件夹"))
 
     # ===== Folder / Scan =====
 
@@ -433,11 +506,11 @@ class SelectWindow(QMainWindow):
             self._folder_label.setText(text)
             self._folder_label.setToolTip(text)
         else:
-            self._folder_label.setText("未设置文件夹")
+            self._folder_label.setText(tr("未设置文件夹"))
             self._folder_label.setToolTip("")
 
     def _choose_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "选择音乐文件夹", self._config.music_folder or "")
+        folder = QFileDialog.getExistingDirectory(self, tr("选择音乐文件夹"), self._config.music_folder or "")
         if folder:
             self._config.music_folder = folder
             save_config(self._config)
@@ -467,15 +540,15 @@ class SelectWindow(QMainWindow):
             return
         folder = self._config.music_folder
         if not folder:
-            self._status_left.setText("请先设置音乐文件夹")
+            self._status_left.setText(tr("请先设置音乐文件夹"))
             return
         path = Path(folder)
         if not path.exists() or not path.is_dir():
-            self._status_left.setText("文件夹无效")
+            self._status_left.setText(tr("文件夹无效"))
             return
 
         self._set_scanning(True)
-        self._set_progress_busy("正在扫描音乐文件夹…")
+        self._set_progress_busy(tr("正在扫描音乐文件夹…"))
         self._scan_worker = ScanWorker(folder)
         self._scan_worker.finished.connect(self._on_scan_finished)
         self._scan_worker.error.connect(self._on_scan_error)
@@ -487,13 +560,13 @@ class SelectWindow(QMainWindow):
         self._refresh_artist_list()
         self._refresh_letter_list()
         self._refresh_song_table()
-        self._status_left.setText(f"共 {self._db.song_count()} 首")
+        self._status_left.setText(tr("共 {count} 首", count=self._db.song_count()))
         self._set_scanning(False)
         self._scan_worker = None
         self._start_avatar_worker()
 
     def _on_scan_error(self, message: str) -> None:
-        self._status_left.setText(f"扫描错误: {message}")
+        self._status_left.setText(tr("扫描错误: {message}", message=message))
         self._set_scanning(False)
         self._set_progress_idle()
         self._scan_worker = None
@@ -531,7 +604,7 @@ class SelectWindow(QMainWindow):
     def _refresh_artist_list(self) -> None:
         self._artist_list.blockSignals(True)
         self._artist_list.clear()
-        all_item = QListWidgetItem(f"全部 ({self._db.song_count()})")
+        all_item = QListWidgetItem(tr("全部 ({count})", count=self._db.song_count()))
         all_item.setData(Qt.UserRole, None)
         all_item.setIcon(QIcon(self._avatar_pixmap("全")))
         self._artist_list.addItem(all_item)
@@ -550,7 +623,7 @@ class SelectWindow(QMainWindow):
     def _refresh_letter_list(self) -> None:
         self._letter_list.blockSignals(True)
         self._letter_list.clear()
-        all_item = QListWidgetItem(f"全部 ({self._db.song_count()})")
+        all_item = QListWidgetItem(tr("全部 ({count})", count=self._db.song_count()))
         all_item.setData(Qt.UserRole, None)
         self._letter_list.addItem(all_item)
         for letter, count in self._db.letters():
@@ -709,17 +782,21 @@ class SelectWindow(QMainWindow):
         self._song_table.selectRow(row)
         song = Song(artist_item.text(), title_item.text(), path)
         menu = QMenu(self)
-        delete_action = menu.addAction("永久删除")
-        delete_action.setToolTip(f"从磁盘删除视频文件：{song.path}")
+        delete_action = menu.addAction(tr("永久删除"))
+        delete_action.setToolTip(tr("从磁盘删除视频文件：{path}", path=song.path))
         if menu.exec(self._song_table.mapToGlobal(pos)) is delete_action:
             self._confirm_delete_song(song)
 
     def _confirm_delete_song(self, song: Song) -> None:
         reply = QMessageBox.question(
             self,
-            "永久删除",
-            f"确定要永久删除这首歌曲吗？\n\n{song.display}\n\n"
-            f"将删除视频文件：\n{song.path}\n\n此操作不可撤销。",
+            tr("永久删除"),
+            tr(
+                "确定要永久删除这首歌曲吗？\n\n{display}\n\n"
+                "将删除视频文件：\n{path}\n\n此操作不可撤销。",
+                display=song.display,
+                path=song.path,
+            ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -732,7 +809,7 @@ class SelectWindow(QMainWindow):
             try:
                 path.unlink()
             except OSError as exc:
-                self._status_bar.showMessage(f"删除文件失败：{exc}", 5000)
+                self._status_bar.showMessage(tr("删除文件失败：{error}", error=str(exc)), 5000)
                 return
         # Stop playback and drop every queued copy before the file is gone.
         current = self._controller.current_song
@@ -749,8 +826,8 @@ class SelectWindow(QMainWindow):
         self._refresh_song_table()
         self._refresh_queue()
         self._update_button_states()
-        self._status_left.setText(f"共 {self._db.song_count()} 首（本地数据库）")
-        self._status_bar.showMessage(f"已永久删除《{song.title}》", 5000)
+        self._update_status_summary()
+        self._status_bar.showMessage(tr("已永久删除《{title}》", title=song.title), 5000)
 
     # ===== Avatar fetching =====
 
@@ -765,7 +842,7 @@ class SelectWindow(QMainWindow):
         self._avatar_worker.fetched.connect(self._on_avatar_fetched)
         self._avatar_worker.progress.connect(self._on_avatar_progress)
         self._avatar_worker.finished_all.connect(self._on_avatar_worker_done)
-        self._set_progress_count("正在获取歌手头像", 0, len(names))
+        self._set_progress_count(tr("正在获取歌手头像"), 0, len(names))
         self._avatar_worker.start()
 
     def _on_avatar_fetched(self, name: str, data) -> None:
@@ -777,7 +854,7 @@ class SelectWindow(QMainWindow):
         self._update_artist_icon(name)
 
     def _on_avatar_progress(self, done: int, total: int) -> None:
-        self._set_progress_count("正在获取歌手头像", done, total)
+        self._set_progress_count(tr("正在获取歌手头像"), done, total)
 
     def _update_artist_icon(self, name: str) -> None:
         for i in range(self._artist_list.count()):
@@ -789,49 +866,45 @@ class SelectWindow(QMainWindow):
     def _on_avatar_worker_done(self) -> None:
         self._avatar_worker = None
         self._set_progress_idle()
-        self._status_left.setText(f"共 {self._db.song_count()} 首歌曲")
+        self._status_left.setText(tr("共 {count} 首歌曲", count=self._db.song_count()))
 
     # ===== Queue table =====
 
     def _refresh_queue(self) -> None:
-        # Preserve selection by song path
+        # Preserve selection by song title
         old_selection = set()
         for idx in self._queue_table.selectionModel().selectedRows():
-            item = self._queue_table.item(idx.row(), 2)
+            item = self._queue_table.item(idx.row(), 1)
             if item:
-                old_selection.add(item.text())
+                old_selection.add(item.text().lstrip("▶ ").strip())
 
         queue = self._controller.queue
         self._queue_table.setRowCount(len(queue))
         for row, song in enumerate(queue):
-            prefix = ""
-            if row == self._controller.current_index:
-                prefix = "▶ "
-            num_item = QTableWidgetItem(f"{prefix}{row + 1}")
-            self._queue_table.setItem(row, 0, num_item)
-            self._queue_table.setItem(row, 1, QTableWidgetItem(song.artist))
-            self._queue_table.setItem(row, 2, QTableWidgetItem(song.title))
+            self._queue_table.setItem(row, 0, QTableWidgetItem(song.artist))
+            title = f"▶ {song.title}" if row == self._controller.current_index else song.title
+            self._queue_table.setItem(row, 1, QTableWidgetItem(title))
 
         self._highlight_current_queue()
 
         # Restore selection where possible
         if old_selection:
             for row in range(self._queue_table.rowCount()):
-                item = self._queue_table.item(row, 2)
-                if item and item.text() in old_selection:
+                item = self._queue_table.item(row, 1)
+                if item and item.text().lstrip("▶ ").strip() in old_selection:
                     self._queue_table.selectRow(row)
 
     def _highlight_current_queue(self) -> None:
         current = self._controller.current_index
         for row in range(self._queue_table.rowCount()):
-            num_item = self._queue_table.item(row, 0)
-            if num_item is None:
+            title_item = self._queue_table.item(row, 1)
+            if title_item is None:
                 continue
-            text = num_item.text().lstrip("▶ ").strip()
+            text = title_item.text().lstrip("▶ ").strip()
             if row == current:
-                num_item.setText(f"▶ {text}")
+                title_item.setText(f"▶ {text}")
             else:
-                num_item.setText(text)
+                title_item.setText(text)
 
         # Update status bar right
         song = self._controller.current_song
@@ -845,7 +918,7 @@ class SelectWindow(QMainWindow):
         )
 
     def _on_state_changed(self, state: str) -> None:
-        self._btn_play.setText("暂停" if state == "playing" else "播放")
+        self._btn_play.setText(tr("暂停") if state == "playing" else tr("播放"))
 
     def _on_audio_track(self, index: int) -> None:
         multi = self._controller.has_multi_audio_track()
@@ -853,14 +926,19 @@ class SelectWindow(QMainWindow):
         self._btn_track.setEnabled(multi and playing)
         self._btn_track.setChecked(index == 1)
         self._btn_track.setToolTip(
-            f"当前音轨：{'伴奏' if index else '原唱'}" if multi
-            else "切换当前歌曲的音轨（原唱/伴奏）"
+            tr("当前音轨：伴奏") if (multi and index) else tr("当前音轨：原唱")
+            if multi
+            else tr("切换当前歌曲的音轨（原唱/伴奏）")
         )
 
     def _on_queue_double_clicked(self) -> None:
         row = self._queue_table.currentRow()
         if 0 <= row < len(self._controller.queue):
             self._controller.play_at(row)
+
+    def _insert_after_current(self) -> None:
+        rows = [idx.row() for idx in self._queue_table.selectionModel().selectedRows()]
+        self._controller.jump_after_current(rows)
 
     def _move_up(self) -> None:
         rows = sorted(set(idx.row() for idx in self._queue_table.selectionModel().selectedRows()))
@@ -883,7 +961,7 @@ class SelectWindow(QMainWindow):
             self._controller.remove_at(row)
 
     def _on_status_message(self, message: str) -> None:
-        self._status_bar.showMessage(message, 5000)
+        self._status_bar.showMessage(tr(message), 5000)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         # Worker threads are daemons: ask them to stop, but never block the
@@ -893,6 +971,7 @@ class SelectWindow(QMainWindow):
         for worker in (self._scan_worker, self._avatar_worker):
             if worker is not None:
                 worker.stop()
+        off_language_changed(self.retranslate)
         super().closeEvent(event)
 
     def _update_button_states(self) -> None:

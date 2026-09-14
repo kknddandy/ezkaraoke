@@ -45,7 +45,7 @@ Homepage = "https://github.com/kknddandy/ezkaraoke"
 Issues = "https://github.com/kknddandy/ezkaraoke/issues"
 
 [tool.setuptools]
-packages = ["ezkaraoke"]
+packages = ["ezkaraoke", "ezkaraoke._segno"]
 
 [tool.setuptools.package-data]
 ezkaraoke = ["theme.qss"]

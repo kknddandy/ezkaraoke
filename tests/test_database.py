@@ -35,6 +35,55 @@ def test_rebuild_dedupes_by_path(tmp_path):
     db.close()
 
 
+def test_size_stored_and_roundtrip(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(
+        [
+            Song("甲", "歌一", "/m/jia-1.mp4", size=1024),
+            Song("甲", "歌二", "/m/jia-2.mp4", size=None),
+        ]
+    )
+    by_path = {s.path: s.size for s in db.all_songs()}
+    assert by_path == {"/m/jia-1.mp4": 1024, "/m/jia-2.mp4": None}
+    stored = db.get_song("/m/jia-1.mp4")
+    assert stored is not None and stored.size == 1024
+    db.close()
+
+
+def test_count_missing_sizes(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(
+        [
+            Song("甲", "歌一", "/m/jia-1.mp4", size=1),
+            Song("甲", "歌二", "/m/jia-2.mp4", size=None),
+            Song("乙", "歌三", "/m/yi-3.mp4", size=None),
+        ]
+    )
+    assert db.count_missing_sizes() == 2
+    db.close()
+
+
+def test_old_db_missing_size_column_is_migrated(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE songs (path TEXT PRIMARY KEY, artist TEXT NOT NULL, "
+        "title TEXT NOT NULL, letter TEXT NOT NULL);"
+        "INSERT INTO songs VALUES ('/m/a.mp4', '甲', '歌一', 'G');"
+    )
+    conn.commit()
+    conn.close()
+    db = SongDatabase(path)
+    cols = {r[1] for r in db._conn.execute("PRAGMA table_info(songs)")}
+    assert "size" in cols
+    migrated = db.get_song("/m/a.mp4")
+    assert migrated is not None and migrated.size is None
+    assert db.count_missing_sizes() == 1
+    db.close()
+
+
 def test_letter_column_stored_and_letters_order(tmp_path):
     db = make_db(tmp_path)
     db.rebuild(SONGS)
@@ -165,4 +214,40 @@ def test_delete_song_removes_row_and_orphan_artist(tmp_path):
     # deleting a missing path is a no-op
     db.delete_song("/m/never.mp4")
     assert db.song_count() == 1
+    db.close()
+
+
+def test_favorites_toggle_and_library_order(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(SONGS)
+    assert db.favorite_songs() == []
+    assert db.toggle_favorite("/m/jay-qing.mp4") is True
+    assert db.is_favorite("/m/jay-qing.mp4")
+    assert db.toggle_favorite("/m/lin-jiang.mp4") is True
+    assert [s.path for s in db.favorite_songs()] == [
+        "/m/jay-qing.mp4",
+        "/m/lin-jiang.mp4",
+    ]
+    # toggling again removes the favorite
+    assert db.toggle_favorite("/m/jay-qing.mp4") is False
+    assert db.favorite_songs() == [Song("林俊杰", "江南", "/m/lin-jiang.mp4")]
+    db.close()
+
+
+def test_rebuild_drops_favorites_of_removed_songs(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(SONGS)
+    db.toggle_favorite("/m/jay-qing.mp4")
+    db.toggle_favorite("/m/lin-jiang.mp4")
+    db.rebuild(SONGS[:2])  # keeps only 晴天 + Hello
+    assert db.favorite_songs() == [Song("周杰伦", "晴天", "/m/jay-qing.mp4")]
+    db.close()
+
+
+def test_delete_song_removes_favorite(tmp_path):
+    db = make_db(tmp_path)
+    db.rebuild(SONGS)
+    db.toggle_favorite("/m/jay-qing.mp4")
+    db.delete_song("/m/jay-qing.mp4")
+    assert db.favorite_songs() == []
     db.close()

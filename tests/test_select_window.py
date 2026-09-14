@@ -9,14 +9,14 @@ import time
 import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
+from PySide6.QtWidgets import QApplication, QHeaderView, QMenu, QMessageBox
 
 from ezkaraoke import avatar as avatar_mod
 from ezkaraoke.config import Config
 from ezkaraoke.database import SongDatabase
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
-from ezkaraoke.select_window import SelectWindow
+from ezkaraoke.select_window import ROLE_SIZE, SelectWindow, format_size
 
 SONGS = [
     Song("周杰伦", "晴天", "/music/周杰伦-晴天.mp4"),
@@ -48,7 +48,7 @@ def win(qapp, tmp_path):
     for name in db.artists():
         db.mark_avatar_tried(name)
     controller = PlayerController()
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     yield window
@@ -129,7 +129,7 @@ def test_artist_list_pinyin_order_a_before_c(qapp, tmp_path):
     db.rebuild(songs)
     for name in db.artists():
         db.mark_avatar_tried(name)
-    window = SelectWindow(PlayerController(), db, Config(music_folder=""))
+    window = SelectWindow(PlayerController(), db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     try:
@@ -213,13 +213,46 @@ def test_avatar_fetched_persists_and_marks_tried(win):
     assert win._db.get_avatar("邓紫棋") is None
 
 
-def test_table_has_two_columns_no_filename(win):
-    assert win._song_table.columnCount() == 2
+def test_table_has_size_column_no_filename(win):
+    # 3 real columns + a trailing spacer that keeps the size column's
+    # resize handle off the splitter at the table's right edge.
+    assert win._song_table.columnCount() == 4
     assert win._song_table.horizontalHeaderItem(0).text() == "歌手"
     assert win._song_table.horizontalHeaderItem(1).text() == "歌名"
+    assert win._song_table.horizontalHeaderItem(2).text() == "文件尺寸"
+    assert win._song_table.horizontalHeaderItem(3).text() == ""
+    header = win._song_table.horizontalHeader()
+    assert header.sectionResizeMode(2) == QHeaderView.Interactive
+    assert header.sectionResizeMode(3) == QHeaderView.Fixed
     # sorting is manual (pinyin-aware); Qt's built-in sort is not used
     assert not win._song_table.isSortingEnabled()
     assert not win._song_table.horizontalHeader().isSortIndicatorShown()
+
+
+def test_format_size():
+    assert format_size(None) == "—"
+    assert format_size(1024 * 1024) == "1.0 MB"
+    assert format_size(150 * 1024 * 1024) == "150 MB"
+    assert format_size(2 * 1024**3) == "2.0 GB"
+
+
+def test_size_column_shows_and_sorts_numerically(win):
+    songs = win._db.all_songs()
+    sized = [
+        Song(s.artist, s.title, s.path, size=(i + 1) * 1024 * 1024)
+        for i, s in enumerate(songs)
+    ]
+    win._db.rebuild(sized)
+    win._refresh_song_table()
+    assert win._song_table.item(0, 2).text() != "—"
+
+    win._on_header_clicked(2)  # ascending by byte count
+    sizes = [
+        win._song_table.item(i, 0).data(ROLE_SIZE)
+        for i in range(win._song_table.rowCount())
+    ]
+    assert sizes == sorted(sizes)
+    assert sizes[0] == 1024 * 1024
 
 
 def test_header_click_sorts_artist_by_pinyin(win):
@@ -265,7 +298,7 @@ def test_mode_switch_stays_fast_on_large_library(qapp, tmp_path):
     for name in artists:
         db.mark_avatar_tried(name)
     controller = PlayerController()
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     t0 = time.monotonic()
@@ -289,7 +322,7 @@ def test_close_is_fast_with_running_avatar_worker(qapp, tmp_path, monkeypatch):
     db = SongDatabase(tmp_path / "songs.db")
     db.rebuild(SONGS)  # not pre-marked -> __init__ starts the avatar worker
     controller = PlayerController()
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     assert window._avatar_worker is not None
@@ -309,7 +342,7 @@ def test_avatar_progress_bar_states(qapp, tmp_path, monkeypatch):
     db = SongDatabase(tmp_path / "songs.db")
     db.rebuild(SONGS)  # not pre-marked -> worker starts in __init__
     controller = PlayerController()
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     seen = []
@@ -323,6 +356,49 @@ def test_avatar_progress_bar_states(qapp, tmp_path, monkeypatch):
     assert any(f.startswith("正在获取歌手头像") for f in seen)
     assert not window._progress.isVisible()  # hidden once done
     assert window._db.get_avatar("周杰伦") is not None
+    window.close()
+    qapp.processEvents()
+    db.close()
+
+
+def test_startup_not_blocked_by_large_avatars(qapp, tmp_path, monkeypatch):
+    # Regression: window construction used to decode every cached avatar
+    # synchronously (30-60 s with a real library), so the app appeared
+    # frozen on start. Now placeholders show immediately and the
+    # AvatarRenderer decodes (and one-time migrates oversized copies) in
+    # the background.
+    import io
+    import os
+
+    from PIL import Image
+
+    monkeypatch.setattr(avatar_mod, "fetch_artist_avatar", lambda name: None)
+    db = SongDatabase(tmp_path / "songs.db")
+    db.rebuild(SONGS)
+    for name in db.artists():
+        db.mark_avatar_tried(name)
+    buf = io.BytesIO()
+    Image.frombytes("RGB", (600, 600), os.urandom(600 * 600 * 3)).save(buf, "JPEG")
+    big = buf.getvalue()
+    for name in db.artists():
+        db.set_avatar(name, big)
+    controller = PlayerController()
+    t0 = time.monotonic()
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
+    elapsed = time.monotonic() - t0
+    window.show()
+    assert elapsed < 2.0, f"window construction blocked {elapsed:.1f}s on avatar decoding"
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        qapp.processEvents()
+        if all(n in window._avatar_cache for n in db.artists()):
+            break
+        time.sleep(0.005)
+    for name in db.artists():
+        assert name in window._avatar_cache  # real photos popped in
+    # The oversized copies were migrated to small clean JPEGs.
+    for name in db.artists():
+        assert len(db.get_avatar(name)) < len(big)
     window.close()
     qapp.processEvents()
     db.close()
@@ -374,7 +450,7 @@ def test_context_menu_permanent_delete(qapp, tmp_path, monkeypatch):
         db.mark_avatar_tried(name)
     controller = PlayerController()
     controller.append(songs[0])  # 晴天 is also queued
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     try:
@@ -411,7 +487,7 @@ def test_context_menu_delete_declined_keeps_everything(qapp, tmp_path, monkeypat
     db.rebuild([song])
     for name in db.artists():
         db.mark_avatar_tried(name)
-    window = SelectWindow(PlayerController(), db, Config(music_folder=""))
+    window = SelectWindow(PlayerController(), db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     try:
@@ -443,7 +519,7 @@ def test_context_menu_delete_current_song_stops_playback(qapp, tmp_path, monkeyp
     controller._queue = [s1, s2]  # pretend 正在播 is current (no VLC needed)
     controller._current_index = 0
     assert controller.current_song is not None
-    window = SelectWindow(controller, db, Config(music_folder=""))
+    window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
     window.show()
     qapp.processEvents()
     try:
@@ -515,22 +591,24 @@ def _select_song_row(win, title: str) -> None:
     raise AssertionError(f"no table row with title {title}")
 
 
-def test_queue_table_has_no_number_column(win):
+def test_queue_table_has_heart_column(win):
     # The 序号 column duplicated the vertical-header row numbers and is
-    # gone; the current song is marked with "▶ " in the title cell.
-    assert win._queue_table.columnCount() == 2
-    assert win._queue_table.horizontalHeaderItem(0).text() == "歌手"
-    assert win._queue_table.horizontalHeaderItem(1).text() == "歌名"
+    # gone; column 0 is the clickable favorite heart; the current song is
+    # marked with "▶ " in the title cell.
+    assert win._queue_table.columnCount() == 3
+    assert win._queue_table.horizontalHeaderItem(0).text() == ""
+    assert win._queue_table.horizontalHeaderItem(1).text() == "歌手"
+    assert win._queue_table.horizontalHeaderItem(2).text() == "歌名"
 
 
 def test_queue_current_song_marked_in_title(qapp, win):
     _select_song_row(win, "晴天")
     win._btn_append.click()  # auto-plays 晴天
     qapp.processEvents()
-    assert win._queue_table.item(0, 1).text() == "▶ 晴天"
+    assert win._queue_table.item(0, 2).text() == "▶ 晴天"
     win._controller.stop()
     qapp.processEvents()
-    assert win._queue_table.item(0, 1).text() == "晴天"
+    assert win._queue_table.item(0, 2).text() == "晴天"
 
 
 def test_queue_insert_button_moves_selected_after_current(qapp, win):
@@ -576,6 +654,85 @@ def test_queue_insert_button_multi_select_keeps_order(qapp, win):
     qapp.processEvents()
 
 
+# ------------------------------------------------------- queue table / 红心
+
+def test_queue_heart_toggles_favorite(qapp, win):
+    _select_song_row(win, "晴天")
+    win._btn_append.click()
+    qapp.processEvents()
+    path = win._controller.queue[0].path
+    assert not win._db.is_favorite(path)
+    assert win._queue_table.item(0, 0).text() == "♡"
+    win._on_queue_item_clicked(win._queue_table.item(0, 0))
+    assert win._db.is_favorite(path)
+    assert win._queue_table.item(0, 0).text() == "♥"
+    win._on_queue_item_clicked(win._queue_table.item(0, 0))
+    assert not win._db.is_favorite(path)
+    assert win._queue_table.item(0, 0).text() == "♡"
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_queue_click_non_heart_column_is_inert(qapp, win):
+    _select_song_row(win, "晴天")
+    win._btn_append.click()
+    qapp.processEvents()
+    path = win._controller.queue[0].path
+    win._on_queue_item_clicked(win._queue_table.item(0, 1))
+    assert not win._db.is_favorite(path)
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_queue_heart_survives_refresh(qapp, win):
+    _select_song_row(win, "晴天")
+    win._btn_append.click()
+    qapp.processEvents()
+    win._db.toggle_favorite(win._controller.queue[0].path)
+    _select_song_row(win, "七里香")
+    win._btn_append.click()  # queue change -> refresh re-renders the hearts
+    qapp.processEvents()
+    assert win._queue_table.item(0, 0).text() == "♥"
+    assert win._queue_table.item(1, 0).text() == "♡"
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_queue_all_favorites_button_adds_missing_songs(qapp, win):
+    for title in ("晴天", "光年之外", "江南"):
+        _select_song_row(win, title)
+        row = win._song_table.currentRow()
+        win._db.toggle_favorite(win._song_table.item(row, 0).data(Qt.UserRole))
+    _select_song_row(win, "晴天")
+    win._btn_append.click()
+    qapp.processEvents()
+    win._btn_queue_favs.click()
+    qapp.processEvents()
+    # Library order (周杰伦 < 林俊杰 < 邓紫棋); 晴天 is already queued.
+    assert [s.title for s in win._controller.queue] == ["晴天", "江南", "光年之外"]
+    assert win._status_bar.currentMessage() == "已加入 2 首红心歌曲"
+    win._btn_queue_favs.click()
+    qapp.processEvents()
+    assert win._status_bar.currentMessage() == "红心歌曲都已在队列中"
+    win._controller.stop()
+    qapp.processEvents()
+
+
+def test_queue_all_favorites_none(qapp, win):
+    win._btn_queue_favs.click()
+    assert win._status_bar.currentMessage() == "没有红心歌曲"
+
+
+def test_double_click_heart_cell_does_not_play(qapp, win):
+    _select_song_row(win, "晴天")
+    win._btn_append.click()
+    qapp.processEvents()
+    win._controller.stop()
+    qapp.processEvents()
+    win._on_queue_double_clicked(win._queue_table.model().index(0, 0))
+    assert not win._controller.is_playing
+
+
 def test_play_pause_button(qapp, win):
     c = win._controller
     assert win._btn_play.text() == "播放"
@@ -594,3 +751,26 @@ def test_play_pause_button(qapp, win):
     c.stop()
     qapp.processEvents()
     assert win._btn_play.text() == "播放"
+
+
+# ------------------------------------------------- phone ordering (QR row)
+def test_qr_row_shows_code_and_url(qapp, win):
+    assert win._web is not None
+    assert win._qr_row.isVisible()
+    # An ephemeral-port service must have started (no 8848 conflict in tests).
+    url = win._web.url
+    assert url.startswith("http://")
+    assert 0 < int(url.rsplit(":", 1)[1]) < 65536
+    assert win._qr_label.pixmap() is not None
+    assert not win._qr_label.pixmap().isNull()
+    assert win._qr_url.text() == url
+    assert win._qr_title.text() == "手机扫码点歌"
+
+
+def test_qr_row_unavailable_on_port_conflict(qapp, win, monkeypatch):
+    # Simulate a busy port: start() failed, so the row shows an error label.
+    win._web._httpd = None
+    win._set_qr_unavailable("手机点歌服务启动失败（端口 8848 被占用）")
+    qapp.processEvents()
+    assert win._qr_label.pixmap().isNull()
+    assert "8848" in win._qr_url.text()

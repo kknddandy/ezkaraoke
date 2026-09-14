@@ -25,6 +25,7 @@ _EN: dict[str, str] = {
     "重新扫描": "Rescan",
     "搜索歌手或歌名…": "Search artist or title…",
     "歌名": "Title",
+    "文件尺寸": "Size",
     "序号": "#",
     "点歌": "Queue",
     "插入播放": "Insert",
@@ -41,9 +42,19 @@ _EN: dict[str, str] = {
     "把选中的歌曲移到正在播放歌曲的下一首": (
         "Move the selected song to play right after the current one"
     ),
+    # ---- phone ordering (QR + web service)
+    "手机扫码点歌": "Scan QR to order songs",
+    "手机点歌服务启动失败（端口 {port} 被占用）": (
+        "Phone ordering unavailable (port {port} is in use)"
+    ),
     "上移": "Up",
     "下移": "Down",
     "删除": "Remove",
+    "红心入队": "Queue ♥",
+    "把所有红心歌曲加入队列": "Add every ♥ song to the queue",
+    "没有红心歌曲": "No ♥ songs yet",
+    "红心歌曲都已在队列中": "All ♥ songs are already queued",
+    "已加入 {count} 首红心歌曲": "Queued {count} ♥ songs",
     "未设置文件夹": "No folder set",
     "选择音乐文件夹": "Choose Music Folder",
     "文件夹不存在": "Folder does not exist",
@@ -93,8 +104,8 @@ _EN: dict[str, str] = {
     ),
     "缺少 ffmpeg：变调同时改变速度": "ffmpeg missing: pitch shift also changes tempo",
     # ---- status messages (emitted as raw keys by PlayerController)
-    "未检测到 VLC 运行库，请安装 VLC 后重启 (sudo apt install vlc)": (
-        "VLC runtime not detected. Install VLC and restart (sudo apt install vlc)"
+    "未检测到 VLC 运行库，请安装 VLC 后重启": (
+        "VLC runtime not detected. Install VLC and restart"
     ),
     "已切换为原唱": "Switched to the vocal track",
     "已切换为伴奏": "Switched to the karaoke track",

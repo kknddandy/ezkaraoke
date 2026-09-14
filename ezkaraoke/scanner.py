@@ -38,11 +38,19 @@ def parse_filename(name: str) -> tuple[str, str]:
     return artist, title
 
 
+def file_size(path: str) -> int | None:
+    """st_size in bytes, or None if the file is missing/unreadable."""
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
+
+
 def scan_folder(root: str) -> list[Song]:
     """Recursively scan *root* for video files.
 
     Walks with sorted dirs/files for deterministic output. Extension
-    matching is case-insensitive.
+    matching is case-insensitive. Each song carries its file size.
     """
     songs: list[Song] = []
     root = os.path.abspath(root)
@@ -53,9 +61,10 @@ def scan_folder(root: str) -> list[Song]:
             ext = Path(filename).suffix.lower()
             if ext not in VIDEO_EXTS:
                 continue
+            path = os.path.join(dirpath, filename)
             artist, title = parse_filename(filename)
             songs.append(
-                Song(artist=artist, title=title, path=os.path.join(dirpath, filename))
+                Song(artist=artist, title=title, path=path, size=file_size(path))
             )
     return songs
 
@@ -108,3 +117,76 @@ class ScanWorker(threading.Thread):
             return
         if not self._stop.is_set():
             self._signals.finished.emit(songs)
+
+
+class _SizeBackfillSignals(QObject):
+    """Qt signals owned by the worker; emitted from the worker thread."""
+
+    done = Signal()
+
+
+class SizeBackfillWorker(threading.Thread):
+    """Fill in missing song file sizes for a pre-existing database.
+
+    Runs on a daemon thread so it never blocks window close or process
+    exit. It opens its OWN read-write SQLite connection (the GUI thread's
+    connection must stay on the GUI thread) and only stats paths whose
+    ``size`` is still NULL, so a re-run is cheap and resumable.
+    """
+
+    _FLUSH_EVERY = 500
+
+    def __init__(self, db_path: str) -> None:
+        super().__init__(daemon=True)
+        self.db_path = db_path
+        self._stop = threading.Event()
+        self._signals = _SizeBackfillSignals()
+
+    @property
+    def done(self):
+        return self._signals.done
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def isRunning(self) -> bool:  # noqa: N802 - QThread-compatible name
+        return self.is_alive()
+
+    def wait(self, ms: int = 5000) -> bool:  # noqa: A003 - QThread-compatible
+        self.join(ms / 1000.0)
+        return not self.is_alive()
+
+    def run(self) -> None:
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(self.db_path)
+            try:
+                rows = conn.execute(
+                    "SELECT path FROM songs WHERE size IS NULL"
+                ).fetchall()
+                pending: list[tuple[int, str]] = []
+                for (path,) in rows:
+                    if self._stop.is_set():
+                        break
+                    size = file_size(path)
+                    if size is None:
+                        continue
+                    pending.append((size, path))
+                    if len(pending) >= self._FLUSH_EVERY:
+                        conn.executemany(
+                            "UPDATE songs SET size = ? WHERE path = ?", pending
+                        )
+                        conn.commit()
+                        pending = []
+                if pending:
+                    conn.executemany(
+                        "UPDATE songs SET size = ? WHERE path = ?", pending
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+        if not self._stop.is_set():
+            self._signals.done.emit()

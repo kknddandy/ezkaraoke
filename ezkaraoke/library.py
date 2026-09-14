@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -10,6 +10,9 @@ class Song:
     artist: str
     title: str
     path: str
+    # File size in bytes; None until known. Excluded from equality so
+    # Song(a, t, p) == Song(a, t, p, size=n) round-trips cleanly.
+    size: int | None = field(default=None, compare=False)
 
     @property
     def display(self) -> str:

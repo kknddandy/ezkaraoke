@@ -320,6 +320,19 @@ QProgressBar::chunk {
     border-radius: 4px;
 }
 
+/* ===== Phone ordering (QR + web service) ===== */
+QLabel#QrTitle {
+    color: #ececec;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+QLabel#QrUrl {
+    color: #e8a030;
+    font-size: 12px;
+    font-family: "Consolas", "Menlo", monospace;
+}
+
 /* ===== Tool Bar ===== */
 QToolBar {
     background-color: #161622;

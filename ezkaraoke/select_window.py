@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint, QRect, QSize
+from PySide6.QtCore import QModelIndex, QPoint, QRect, QSize, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 )
 
 from ezkaraoke import i18n
-from ezkaraoke.avatar import AvatarWorker, strip_png_iccp
+from ezkaraoke.avatar import AvatarRenderer, AvatarWorker, clean_image_data
 from ezkaraoke.config import Config, save_config
 from ezkaraoke.database import SongDatabase
 from ezkaraoke.i18n import on_language_changed, off_language_changed, tr
@@ -42,7 +42,8 @@ from ezkaraoke.letters import pinyin_key
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
 from ezkaraoke.pitchshift import remove_cached_for
-from ezkaraoke.scanner import ScanWorker
+from ezkaraoke.scanner import ScanWorker, SizeBackfillWorker
+from ezkaraoke.web_server import WebServer, qr_pixmap
 
 
 def placeholder_label(text: str) -> str:
@@ -97,6 +98,23 @@ class _SongItem(QTableWidgetItem):
         return super().__lt__(other)
 
 
+# Raw file size in bytes, stored per row for numeric sorting (the visible
+# text is human-formatted and not sortable on its own).
+ROLE_SIZE = Qt.UserRole + 1
+
+
+def format_size(size: int | None) -> str:
+    """Human-readable size: MB by default, GB once >= 1 GiB."""
+    if size is None:
+        return "—"
+    mb = size / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.1f} GB"
+    if mb >= 100:
+        return f"{mb:.0f} MB"
+    return f"{mb:.1f} MB"
+
+
 def avatar_pixmap(name: str, data: bytes | None, size: int = 40) -> QPixmap:
     """Avatar with the pinyin letter label always drawn on top.
 
@@ -109,8 +127,7 @@ def avatar_pixmap(name: str, data: bytes | None, size: int = 40) -> QPixmap:
     label = placeholder_label(name)
     photo = None
     if data:
-        if data[:4] == b"\x89PNG":
-            data = strip_png_iccp(data)  # malformed iCCP triggers qt.gui.icc warnings
+        data = clean_image_data(data)  # malformed ICC/eXIf trigger qt warnings
         pm = QPixmap()
         if pm.loadFromData(data):
             pm = pm.scaled(
@@ -173,11 +190,14 @@ class SelectWindow(QMainWindow):
         self._config = config
         self._scan_worker: ScanWorker | None = None
         self._avatar_worker: AvatarWorker | None = None
+        self._avatar_renderer: AvatarRenderer | None = None
+        self._size_worker: SizeBackfillWorker | None = None
         self._mode: str = "artist"
         self._current_artist: str | None = None
         self._current_letter: str | None = None
         self._search_text: str = ""
         self._avatar_cache: dict[str, QPixmap] = {}
+        self._artist_rows: dict[str, int] = {}
 
         self.setWindowTitle(tr("ezkaraoke · 点歌台"))
         self.resize(1280, 760)
@@ -278,15 +298,28 @@ class SelectWindow(QMainWindow):
 
         center_layout.addWidget(toolbar)
 
-        # Song table (click 歌手/歌名 headers to sort; pinyin order for CJK).
-        # #SongTable gets the large display font via theme.qss.
+        # Song table (click 歌手/歌名/文件尺寸 headers to sort; pinyin order
+        # for CJK, numeric for size). #SongTable gets the large display font
+        # via theme.qss.
+        #
+        # A trailing fixed-width spacer keeps the 文件尺寸 resize handle off
+        # the table's right edge; otherwise it sits under the 4px splitter
+        # handle and dragging there resizes the splitter, not the column.
         self._song_table = QTableWidget(self)
         self._song_table.setObjectName("SongTable")
-        self._song_table.setColumnCount(2)
-        self._song_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
-        self._song_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
-        self._song_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self._song_table.setColumnWidth(0, 260)
+        self._song_table.setColumnCount(4)
+        self._song_table.setHorizontalHeaderLabels(
+            [tr("歌手"), tr("歌名"), tr("文件尺寸"), ""]
+        )
+        header = self._song_table.horizontalHeader()
+        header.setMinimumSectionSize(20)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Fixed)
+        self._song_table.setColumnWidth(0, 240)
+        self._song_table.setColumnWidth(2, 120)
+        self._song_table.setColumnWidth(3, 20)
         # Comfortable breathing room around the 28px display font
         self._song_table.verticalHeader().setDefaultSectionSize(52)
         # Manual pinyin-aware sorting: Qt's built-in sort compares raw text
@@ -346,24 +379,39 @@ class SelectWindow(QMainWindow):
 
         splitter.addWidget(center_widget)
 
-        # ===== Right: Play queue =====
+        # ===== Right: Phone-ordering QR + Play queue =====
         right_widget = QWidget(self)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(4, 8, 8, 8)
         right_layout.setSpacing(10)
 
+        # Phone ordering: the QR code decodes to the LAN web service URL.
+        self._web = WebServer(
+            self._db, self._controller, self._config.web_port, parent=self
+        )
+        self._qr_row = self._build_qr_row()
+        right_layout.addWidget(self._qr_row)
+        if not self._web.start():
+            self._set_qr_unavailable(
+                tr("手机点歌服务启动失败（端口 {port} 被占用）", port=self._config.web_port)
+            )
+        else:
+            self._update_qr()
+
         # Row numbers stay on the vertical header; a separate 序号 column
         # would repeat them. The current song is marked with "▶ " in the
-        # title cell.
+        # title cell. Column 0 is the clickable favorite heart.
         self._queue_table = QTableWidget(self)
-        self._queue_table.setColumnCount(2)
-        self._queue_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
+        self._queue_table.setColumnCount(3)
+        self._queue_table.setHorizontalHeaderLabels(["", tr("歌手"), tr("歌名")])
         self._queue_table.horizontalHeader().setStretchLastSection(True)
+        self._queue_table.setColumnWidth(0, 34)
         self._queue_table.setSelectionBehavior(QTableWidget.SelectRows)
         self._queue_table.setSelectionMode(QTableWidget.ExtendedSelection)
         self._queue_table.setAlternatingRowColors(True)
         self._queue_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._queue_table.doubleClicked.connect(self._on_queue_double_clicked)
+        self._queue_table.itemClicked.connect(self._on_queue_item_clicked)
         right_layout.addWidget(self._queue_table, stretch=1)
 
         queue_bar = QWidget(self)
@@ -391,6 +439,12 @@ class SelectWindow(QMainWindow):
         self._btn_remove.setObjectName("ToolButton")
         self._btn_remove.clicked.connect(self._remove_selected)
         queue_bar_layout.addWidget(self._btn_remove)
+
+        self._btn_queue_favs = QPushButton(tr("红心入队"), self)
+        self._btn_queue_favs.setObjectName("ToolButton")
+        self._btn_queue_favs.setToolTip(tr("把所有红心歌曲加入队列"))
+        self._btn_queue_favs.clicked.connect(self._queue_all_favorites)
+        queue_bar_layout.addWidget(self._btn_queue_favs)
 
         queue_bar_layout.addStretch()
         right_layout.addWidget(queue_bar)
@@ -431,6 +485,8 @@ class SelectWindow(QMainWindow):
         if self._db.song_count() > 0:
             self._update_status_summary()
             self._start_avatar_worker()
+            self._start_avatar_renderer()
+            self._start_size_backfill()
         elif self._config.music_folder:
             folder = Path(self._config.music_folder)
             if folder.exists() and folder.is_dir():
@@ -464,18 +520,23 @@ class SelectWindow(QMainWindow):
         self._btn_rescan.setText(tr("重新扫描"))
         self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
         self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
-        self._song_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
+        self._song_table.setHorizontalHeaderLabels(
+            [tr("歌手"), tr("歌名"), tr("文件尺寸"), ""]
+        )
         self._btn_append.setText(tr("点歌"))
         self._btn_insert.setText(tr("插入播放"))
         self._btn_play_now.setText(tr("立即播放"))
         self._btn_play.setText(tr("暂停") if self._controller.is_playing else tr("播放"))
         self._btn_track.setText(tr("原唱/伴奏"))
-        self._queue_table.setHorizontalHeaderLabels([tr("歌手"), tr("歌名")])
+        self._queue_table.setHorizontalHeaderLabels(["", tr("歌手"), tr("歌名")])
         self._btn_jump.setText(tr("插歌"))
         self._btn_jump.setToolTip(tr("把选中的歌曲移到正在播放歌曲的下一首"))
         self._btn_up.setText(tr("上移"))
         self._btn_down.setText(tr("下移"))
         self._btn_remove.setText(tr("删除"))
+        self._btn_queue_favs.setText(tr("红心入队"))
+        self._btn_queue_favs.setToolTip(tr("把所有红心歌曲加入队列"))
+        self._qr_title.setText(tr("手机扫码点歌"))
         self._update_folder_label()
         self._on_audio_track(self._controller.audio_track_index)
         self._update_status_summary()
@@ -538,6 +599,11 @@ class SelectWindow(QMainWindow):
     def _start_scan(self) -> None:
         if self._scan_worker is not None and self._scan_worker.isRunning():
             return
+        # A rescan rebuilds the songs table; let the one-shot size backfill
+        # finish first so the two writers don't contend for the SQLite lock.
+        if self._size_worker is not None and self._size_worker.isRunning():
+            self._size_worker.stop()
+            self._size_worker.wait()
         folder = self._config.music_folder
         if not folder:
             self._status_left.setText(tr("请先设置音乐文件夹"))
@@ -564,12 +630,30 @@ class SelectWindow(QMainWindow):
         self._set_scanning(False)
         self._scan_worker = None
         self._start_avatar_worker()
+        self._start_avatar_renderer()
 
     def _on_scan_error(self, message: str) -> None:
         self._status_left.setText(tr("扫描错误: {message}", message=message))
         self._set_scanning(False)
         self._set_progress_idle()
         self._scan_worker = None
+
+    def _start_size_backfill(self) -> None:
+        """Fill in file sizes for rows written before the size column existed.
+
+        One-shot on launch: a no-op when every row already has a size.
+        """
+        if self._size_worker is not None and self._size_worker.isRunning():
+            return
+        if self._db.count_missing_sizes() == 0:
+            return
+        self._size_worker = SizeBackfillWorker(str(self._db.path))
+        self._size_worker.done.connect(self._on_size_backfill_done)
+        self._size_worker.start()
+
+    def _on_size_backfill_done(self) -> None:
+        self._size_worker = None
+        self._refresh_song_table()
 
     # ===== Mode / lists =====
 
@@ -593,17 +677,26 @@ class SelectWindow(QMainWindow):
             self._artist_list.show()
         self._refresh_song_table()
 
-    def _avatar_pixmap(self, name: str) -> QPixmap:
-        """Cached avatar pixmap (decoded once per avatar, not per refresh)."""
+    def _avatar_pixmap(self, name: str, eager: bool = False) -> QPixmap:
+        """Avatar pixmap for *name*.
+
+        Cached real photos are returned instantly. Without a cache hit,
+        *eager* decodes the stored image on the spot; otherwise a
+        placeholder is returned (the background renderer replaces it as
+        soon as it is ready).
+        """
         pixmap = self._avatar_cache.get(name)
         if pixmap is None:
-            pixmap = avatar_pixmap(name, self._db.get_avatar(name), size=112)
-            self._avatar_cache[name] = pixmap
+            data = self._db.get_avatar(name) if eager else None
+            pixmap = avatar_pixmap(name, data, size=112)
+            if data:
+                self._avatar_cache[name] = pixmap
         return pixmap
 
     def _refresh_artist_list(self) -> None:
         self._artist_list.blockSignals(True)
         self._artist_list.clear()
+        self._artist_rows.clear()
         all_item = QListWidgetItem(tr("全部 ({count})", count=self._db.song_count()))
         all_item.setData(Qt.UserRole, None)
         all_item.setIcon(QIcon(self._avatar_pixmap("全")))
@@ -612,11 +705,14 @@ class SelectWindow(QMainWindow):
             self._db.artist_counts(),
             key=lambda p: [s.lower() for s in pinyin_key(p[0])],
         )
+        row = 1
         for name, count in ordered:
             item = QListWidgetItem(f"{name} ({count})")
             item.setData(Qt.UserRole, name)
             item.setIcon(QIcon(self._avatar_pixmap(name)))
             self._artist_list.addItem(item)
+            self._artist_rows[name] = row
+            row += 1
         self._artist_list.blockSignals(False)
         self._artist_list.setCurrentRow(0)
 
@@ -673,13 +769,24 @@ class SelectWindow(QMainWindow):
         for row, song in enumerate(songs):
             artist_item = _SongItem(song.artist, pinyin_key(song.artist) + [song.artist])
             artist_item.setData(Qt.UserRole, song.path)
+            artist_item.setData(ROLE_SIZE, song.size)
             table.setItem(row, 0, artist_item)
             table.setItem(row, 1, _SongItem(song.title, pinyin_key(song.title) + [song.title]))
+            table.setItem(row, 2, self._size_item(song.size))
         if self._sort_column is not None:
             self._sort_table()
         self._update_button_states()
 
+    def _size_item(self, size: int | None) -> QTableWidgetItem:
+        item = QTableWidgetItem(format_size(size))
+        item.setTextAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        return item
+
     def _on_header_clicked(self, column: int) -> None:
+        if column >= self._song_table.columnCount() - 1:
+            return  # trailing spacer: not a sortable column
         if self._sort_column == column:
             self._sort_order = (
                 Qt.SortOrder.DescendingOrder
@@ -706,17 +813,27 @@ class SelectWindow(QMainWindow):
                     artist_item.text(),
                     title_item.text(),
                     artist_item.data(Qt.UserRole),
+                    artist_item.data(ROLE_SIZE),
                 )
             )
-        primary, secondary = (0, 1) if self._sort_column == 0 else (1, 0)
-        rows.sort(key=lambda r: (r[primary], r[secondary]), reverse=self._sort_order == Qt.SortOrder.DescendingOrder)
+        col = self._sort_column
+        if col == 2:
+            # Size (bytes) primary, missing sizes last; artist order as tie-break.
+            key = lambda r: ((r[5] if r[5] is not None else -1), r[0], r[2])
+        elif col == 1:
+            key = lambda r: (r[1], r[0])
+        else:
+            key = lambda r: (r[0], r[1])
+        rows.sort(key=key, reverse=self._sort_order == Qt.SortOrder.DescendingOrder)
         table.setRowCount(0)
         table.setRowCount(len(rows))
-        for r, (akey, tkey, artist, title, path) in enumerate(rows):
+        for r, (akey, tkey, artist, title, path, size) in enumerate(rows):
             artist_item = _SongItem(artist, akey + [artist])
             artist_item.setData(Qt.UserRole, path)
+            artist_item.setData(ROLE_SIZE, size)
             table.setItem(r, 0, artist_item)
             table.setItem(r, 1, _SongItem(title, tkey + [title]))
+            table.setItem(r, 2, self._size_item(size))
         header = table.horizontalHeader()
         header.setSortIndicatorShown(True)
         header.setSortIndicator(self._sort_column, self._sort_order)
@@ -735,7 +852,12 @@ class SelectWindow(QMainWindow):
             if artist_item is None or title_item is None:
                 continue
             songs.append(
-                Song(artist_item.text(), title_item.text(), artist_item.data(Qt.UserRole))
+                Song(
+                    artist_item.text(),
+                    title_item.text(),
+                    artist_item.data(Qt.UserRole),
+                    size=artist_item.data(ROLE_SIZE),
+                )
             )
         return songs
 
@@ -823,6 +945,7 @@ class SelectWindow(QMainWindow):
         remove_cached_for(song.path)
         self._refresh_artist_list()
         self._refresh_letter_list()
+        self._start_avatar_renderer()
         self._refresh_song_table()
         self._refresh_queue()
         self._update_button_states()
@@ -857,11 +980,36 @@ class SelectWindow(QMainWindow):
         self._set_progress_count(tr("正在获取歌手头像"), done, total)
 
     def _update_artist_icon(self, name: str) -> None:
-        for i in range(self._artist_list.count()):
-            item = self._artist_list.item(i)
-            if item.data(Qt.UserRole) == name:
-                item.setIcon(QIcon(self._avatar_pixmap(name)))
-                return
+        row = self._artist_rows.get(name)
+        if row is None:
+            return
+        item = self._artist_list.item(row)
+        if item is not None:
+            item.setIcon(QIcon(self._avatar_pixmap(name, eager=True)))
+
+    def _start_avatar_renderer(self) -> None:
+        if self._avatar_renderer is not None and self._avatar_renderer.isRunning():
+            return
+        names = [name for name, _ in self._db.artist_counts() if name != "未知歌手"]
+        if not names:
+            return
+        self._avatar_renderer = AvatarRenderer(names, self._db.path)
+        self._avatar_renderer.rendered.connect(self._on_avatar_rendered)
+        self._avatar_renderer.finished_all.connect(self._on_avatar_renderer_done)
+        self._avatar_renderer.start()
+
+    def _on_avatar_rendered(self, batch) -> None:
+        # (artist, clean bytes) decoded off the GUI thread. Shrunken copies
+        # are already persisted by the renderer itself, so this slot only
+        # paints — no bulk DB I/O on the GUI thread.
+        for name, data in batch:
+            if not data:
+                continue
+            self._avatar_cache.pop(name, None)
+            self._update_artist_icon(name)
+
+    def _on_avatar_renderer_done(self) -> None:
+        self._avatar_renderer = None
 
     def _on_avatar_worker_done(self) -> None:
         self._avatar_worker = None
@@ -874,30 +1022,53 @@ class SelectWindow(QMainWindow):
         # Preserve selection by song title
         old_selection = set()
         for idx in self._queue_table.selectionModel().selectedRows():
-            item = self._queue_table.item(idx.row(), 1)
+            item = self._queue_table.item(idx.row(), 2)
             if item:
                 old_selection.add(item.text().lstrip("▶ ").strip())
 
         queue = self._controller.queue
         self._queue_table.setRowCount(len(queue))
         for row, song in enumerate(queue):
-            self._queue_table.setItem(row, 0, QTableWidgetItem(song.artist))
+            self._set_queue_heart(row, song.path)
+            self._queue_table.setItem(row, 1, QTableWidgetItem(song.artist))
             title = f"▶ {song.title}" if row == self._controller.current_index else song.title
-            self._queue_table.setItem(row, 1, QTableWidgetItem(title))
+            self._queue_table.setItem(row, 2, QTableWidgetItem(title))
 
         self._highlight_current_queue()
 
         # Restore selection where possible
         if old_selection:
             for row in range(self._queue_table.rowCount()):
-                item = self._queue_table.item(row, 1)
+                item = self._queue_table.item(row, 2)
                 if item and item.text().lstrip("▶ ").strip() in old_selection:
                     self._queue_table.selectRow(row)
+
+    def _set_queue_heart(self, row: int, path: str) -> None:
+        heart = QTableWidgetItem()
+        fav = self._db.is_favorite(path)
+        heart.setText("♥" if fav else "♡")
+        heart.setForeground(QColor("#e5484d") if fav else QColor("#8a8f98"))
+        heart.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._queue_table.setItem(row, 0, heart)
+
+    def _on_queue_item_clicked(self, item: QTableWidgetItem) -> None:
+        """Clicking the heart cell toggles the song's favorite state."""
+        if item.column() != 0:
+            return
+        row = item.row()
+        queue = self._controller.queue
+        if not 0 <= row < len(queue):
+            return
+        fav = self._db.toggle_favorite(queue[row].path)
+        heart = self._queue_table.item(row, 0)
+        if heart is not None:
+            heart.setText("♥" if fav else "♡")
+            heart.setForeground(QColor("#e5484d") if fav else QColor("#8a8f98"))
 
     def _highlight_current_queue(self) -> None:
         current = self._controller.current_index
         for row in range(self._queue_table.rowCount()):
-            title_item = self._queue_table.item(row, 1)
+            title_item = self._queue_table.item(row, 2)
             if title_item is None:
                 continue
             text = title_item.text().lstrip("▶ ").strip()
@@ -931,10 +1102,29 @@ class SelectWindow(QMainWindow):
             else tr("切换当前歌曲的音轨（原唱/伴奏）")
         )
 
-    def _on_queue_double_clicked(self) -> None:
-        row = self._queue_table.currentRow()
+    def _on_queue_double_clicked(self, index: QModelIndex) -> None:
+        # The heart cell is a toggle target, not a play target.
+        if index.column() == 0:
+            return
+        row = index.row()
         if 0 <= row < len(self._controller.queue):
             self._controller.play_at(row)
+
+    def _queue_all_favorites(self) -> None:
+        songs = self._db.favorite_songs()
+        if not songs:
+            self._status_bar.showMessage(tr("没有红心歌曲"), 3000)
+            return
+        in_queue = {s.path for s in self._controller.queue}
+        to_add = [s for s in songs if s.path not in in_queue]
+        if not to_add:
+            self._status_bar.showMessage(tr("红心歌曲都已在队列中"), 3000)
+            return
+        was_empty = not self._controller.queue
+        for song in to_add:
+            self._controller.append(song)
+        self._start_if_first_song(was_empty)
+        self._status_bar.showMessage(tr("已加入 {count} 首红心歌曲", count=len(to_add)), 3000)
 
     def _insert_after_current(self) -> None:
         rows = [idx.row() for idx in self._queue_table.selectionModel().selectedRows()]
@@ -963,14 +1153,60 @@ class SelectWindow(QMainWindow):
     def _on_status_message(self, message: str) -> None:
         self._status_bar.showMessage(tr(message), 5000)
 
+    # ===== Phone ordering (QR + web server) =====
+
+    def _build_qr_row(self) -> QWidget:
+        row = QWidget(self)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self._qr_label = QLabel(row)
+        self._qr_label.setObjectName("QrCode")
+        self._qr_label.setFixedSize(100, 100)
+        self._qr_label.setStyleSheet(
+            "background: #ffffff; border: 1px solid #2a2a3e; border-radius: 6px;"
+        )
+        self._qr_label.setScaledContents(True)
+        layout.addWidget(self._qr_label)
+
+        box = QWidget(row)
+        vbox = QVBoxLayout(box)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(4)
+        self._qr_title = QLabel(tr("手机扫码点歌"), box)
+        self._qr_title.setObjectName("QrTitle")
+        self._qr_url = QLabel(box)
+        self._qr_url.setObjectName("QrUrl")
+        self._qr_url.setWordWrap(True)
+        vbox.addWidget(self._qr_title)
+        vbox.addWidget(self._qr_url)
+        vbox.addStretch()
+        layout.addWidget(box, stretch=1)
+        return row
+
+    def _update_qr(self) -> None:
+        self._qr_label.setPixmap(qr_pixmap(self._web.url))
+        self._qr_url.setText(self._web.url)
+
+    def _set_qr_unavailable(self, text: str) -> None:
+        self._qr_label.clear()
+        self._qr_url.setText(text)
+
     def closeEvent(self, event) -> None:  # noqa: N802
         # Worker threads are daemons: ask them to stop, but never block the
         # close on an in-flight network call (old behavior: close stalled for
         # minutes behind a slow avatar fetch, and closing mid-fetch could
         # abort process finalization).
-        for worker in (self._scan_worker, self._avatar_worker):
+        for worker in (
+            self._scan_worker,
+            self._avatar_worker,
+            self._avatar_renderer,
+            self._size_worker,
+        ):
             if worker is not None:
                 worker.stop()
+        self._web.stop()
         off_language_changed(self.retranslate)
         super().closeEvent(event)
 

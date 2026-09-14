@@ -8,7 +8,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from ezkaraoke.scanner import VIDEO_EXTS, ScanWorker, parse_filename, scan_folder
+from ezkaraoke.database import SongDatabase
+from ezkaraoke.library import Song
+from ezkaraoke.scanner import (
+    VIDEO_EXTS,
+    ScanWorker,
+    SizeBackfillWorker,
+    file_size,
+    parse_filename,
+    scan_folder,
+)
 
 
 @pytest.fixture(scope="session")
@@ -140,3 +149,64 @@ def test_scan_worker_daemon_thread(qapp, tmp_path):
     assert worker.daemon is True  # never blocks interpreter shutdown
     worker.start()
     assert worker.wait(5000)
+
+
+# ------------------------------------------------------------------ file_size
+def test_file_size_returns_byte_count(tmp_path):
+    f = tmp_path / "a.mp4"
+    f.write_bytes(b"12345")
+    assert file_size(str(f)) == 5
+
+
+def test_file_size_missing_returns_none(tmp_path):
+    assert file_size(str(tmp_path / "nope.mp4")) is None
+
+
+def test_scan_folder_records_file_size(tmp_path):
+    (tmp_path / "A-a.mp4").write_bytes(b"x" * 123)
+    songs = scan_folder(str(tmp_path))
+    assert len(songs) == 1
+    assert songs[0].size == 123
+
+
+# -------------------------------------------------------- SizeBackfillWorker
+def _wait_for_worker(qapp, worker, timeout=10.0):
+    deadline = time.time() + timeout
+    while worker.isRunning() and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert worker.wait(5000)
+    for _ in range(100):  # flush queued cross-thread signals
+        qapp.processEvents()
+
+
+def test_size_backfill_fills_missing_sizes(qapp, tmp_path):
+    song_file = tmp_path / "A-a.mp4"
+    song_file.write_bytes(b"y" * 42)
+    db_path = tmp_path / "songs.db"
+
+    db = SongDatabase(db_path)
+    db.rebuild([Song(artist="A", title="a", path=str(song_file), size=None)])
+    assert db.count_missing_sizes() == 1
+
+    worker = SizeBackfillWorker(str(db_path))
+    done: list[bool] = []
+    worker.done.connect(lambda: done.append(True))
+    assert worker.daemon is True
+    worker.start()
+    _wait_for_worker(qapp, worker)
+
+    assert done == [True]
+    assert db.count_missing_sizes() == 0
+    stored = db.get_song(str(song_file))
+    assert stored is not None and stored.size == 42
+
+
+def test_size_backfill_noop_when_all_sizes_known(qapp, tmp_path):
+    song_file = tmp_path / "A-a.mp4"
+    song_file.write_bytes(b"z" * 7)
+    db_path = tmp_path / "songs.db"
+
+    db = SongDatabase(db_path)
+    db.rebuild([Song(artist="A", title="a", path=str(song_file), size=7)])
+    assert db.count_missing_sizes() == 0

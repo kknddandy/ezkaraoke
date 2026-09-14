@@ -8,7 +8,9 @@ becomes a no-op and ``status_message`` is emitted once.
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
+from ctypes.util import find_library
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, QTimer
@@ -16,7 +18,22 @@ from PySide6.QtCore import QObject, Signal, QTimer
 from ezkaraoke import pitchshift
 from ezkaraoke.library import Song
 
-_NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启 (sudo apt install vlc)"
+_NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启"
+
+
+def _vlc_library_names() -> tuple[str, ...]:
+    """Candidate libvlc shared-library names for the current platform."""
+    if sys.platform == "win32":
+        return ("libvlc.dll", "vlc.dll")
+    if sys.platform == "darwin":
+        return ("libvlc.5.dylib", "libvlc.4.dylib", "libvlc.dylib")
+    return (
+        "libvlc.so.5",
+        "libvlc.so.4",
+        "libvlc.so.3",
+        "libvlc.so.12",
+        "libvlc.so.11",
+    )
 
 
 def _detect_pitch_fn(vlc_module):
@@ -25,9 +42,13 @@ def _detect_pitch_fn(vlc_module):
     lib = getattr(vlc_module, "libvlc", None)
     if lib is not None:
         libs.append(lib)
-    for soname in ("libvlc.so.5", "libvlc.so.4", "libvlc.so.3", "libvlc.so.12", "libvlc.so.11"):
+    names = list(_vlc_library_names())
+    found = find_library("vlc")
+    if found:
+        names.append(found)
+    for name in names:
         try:
-            libs.append(ctypes.CDLL(soname))
+            libs.append(ctypes.CDLL(name))
         except OSError:
             continue
     for lib in libs:
@@ -441,6 +462,15 @@ class PlayerController(QObject):
         if not 0 <= self._current_index < len(self._queue):
             return
         self._begin_play(self._current_index)
+
+    def clear_queue(self) -> None:
+        """Stop playback and drop every queued song."""
+        if self._state != "stopped":
+            self.stop()
+        if not self._queue:
+            return
+        self._queue = []
+        self.queue_changed.emit()
 
     # --------------------------------------------------------- transport keys
     def toggle_pause(self) -> None:

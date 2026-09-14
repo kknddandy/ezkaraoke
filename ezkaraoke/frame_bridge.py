@@ -16,6 +16,7 @@ pixel-identical to an ffmpeg YUV->ARGB conversion.
 from __future__ import annotations
 
 import ctypes
+import sys
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage
@@ -24,20 +25,39 @@ from PySide6.QtGui import QImage
 # Loaded via ctypes at import time with graceful failure: if any piece is
 # missing the bridge still constructs, and the callbacks become safe
 # no-ops (no conversion, no emit, no crash).
-_SWS_SONAMES = (
-    "libswscale.so.9",
-    "libswscale.so.8",
-    "libswscale.so.7",
-    "libswscale.so.6",
-    "libswscale.so.5",
-)
-_AU_SONAMES = (
-    "libavutil.so.60",
-    "libavutil.so.59",
-    "libavutil.so.58",
-    "libavutil.so.57",
-    "libavutil.so.56",
-)
+if sys.platform == "win32":
+    _SWS_SONAMES = (
+        "swscale-9.dll", "swscale-8.dll", "swscale-7.dll",
+        "swscale-6.dll", "swscale-5.dll",
+    )
+    _AU_SONAMES = (
+        "avutil-60.dll", "avutil-59.dll", "avutil-58.dll",
+        "avutil-57.dll", "avutil-56.dll",
+    )
+elif sys.platform == "darwin":
+    _SWS_SONAMES = (
+        "libswscale.9.dylib", "libswscale.8.dylib", "libswscale.7.dylib",
+        "libswscale.6.dylib", "libswscale.5.dylib",
+    )
+    _AU_SONAMES = (
+        "libavutil.60.dylib", "libavutil.59.dylib", "libavutil.58.dylib",
+        "libavutil.57.dylib", "libavutil.56.dylib",
+    )
+else:
+    _SWS_SONAMES = (
+        "libswscale.so.9",
+        "libswscale.so.8",
+        "libswscale.so.7",
+        "libswscale.so.6",
+        "libswscale.so.5",
+    )
+    _AU_SONAMES = (
+        "libavutil.so.60",
+        "libavutil.so.59",
+        "libavutil.so.58",
+        "libavutil.so.57",
+        "libavutil.so.56",
+    )
 
 _SWS_GET_CONTEXT = None
 _SWS_SCALE = None

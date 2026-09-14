@@ -45,7 +45,7 @@ def test_ui_smoke(qapp, tmp_path):
     for name in db.artists():
         db.mark_avatar_tried(name)
 
-    config = Config(music_folder="")
+    config = Config(music_folder="", web_port=0)
     controller = PlayerController()
 
     player_win = PlayerWindow(controller)

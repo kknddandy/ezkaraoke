@@ -14,10 +14,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-BASE_DIR = Path.home() / ".local" / "share" / "ezkaraoke"
+from ezkaraoke import paths
+
+BASE_DIR = paths.data_dir()
 CACHE_DIR = BASE_DIR / "pitch_cache"
 
 MAX_CACHE_BYTES = 2 * 1024**3
@@ -26,6 +29,14 @@ KEEP_CACHE_BYTES = 1_500_000_000
 _TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)")
 
 _rubberband_ok: bool | None = None
+
+
+def _spawn_kwargs() -> dict:
+    """Extra Popen kwargs: hide the console window ffmpeg would otherwise
+    flash on Windows (no-op elsewhere)."""
+    if sys.platform == "win32":
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+    return {}
 
 
 def cache_dir() -> Path:
@@ -44,7 +55,10 @@ def shift_available() -> bool:
                     [exe, "-hide_banner", "-filters"],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=15,
+                    **_spawn_kwargs(),
                 ).stdout
                 _rubberband_ok = " rubberband " in out
             except Exception:  # noqa: BLE001 - probe failure means "no"
@@ -112,7 +126,10 @@ def duration_seconds(source: str) -> float | None:
              "-of", "default=nw=1:nk=1", source],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
+            **_spawn_kwargs(),
         )
         return float(out.stdout.strip())
     except (ValueError, OSError, subprocess.SubprocessError):
@@ -151,7 +168,13 @@ def shift_audio(
     total = duration_seconds(source)
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **_spawn_kwargs(),
         )
     except OSError:
         return False

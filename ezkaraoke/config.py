@@ -6,7 +6,9 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-DEFAULT_CONFIG_PATH = Path.home() / ".config" / "ezkaraoke" / "config.json"
+from ezkaraoke import paths
+
+DEFAULT_CONFIG_PATH = paths.config_file()
 
 
 @dataclass
@@ -14,6 +16,7 @@ class Config:
     music_folder: str = ""
     db_path: str = ""
     language: str = "zh"
+    web_port: int = 8848
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -33,8 +36,18 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
     language = data.get("language", "zh")
     if language not in ("zh", "en"):
         language = "zh"
+    web_port = data.get("web_port", 8848)
+    if (
+        not isinstance(web_port, int)
+        or isinstance(web_port, bool)
+        or not 1 <= web_port <= 65535
+    ):
+        web_port = 8848
     return Config(
-        music_folder=music_folder, db_path=db_path, language=language
+        music_folder=music_folder,
+        db_path=db_path,
+        language=language,
+        web_port=web_port,
     )
 
 

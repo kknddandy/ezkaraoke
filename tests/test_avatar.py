@@ -163,13 +163,15 @@ def _jpeg(width: int, height: int, noisy: bool = False) -> bytes:
     return buf.getvalue()
 
 
-def test_bing_image_urls_parsing(monkeypatch):
+def test_bing_image_urls_prefers_turl(monkeypatch):
+    # Thumbnails (turl) are preferred over full-size originals (murl):
+    # avatars render at 112px and full-size originals bloat the BLOBs.
     monkeypatch.setattr(
         avatar_mod, "_browser_get",
         lambda url, referer=None, timeout=10: BING_PAGE,
     )
     assert avatar_mod._bing_image_urls("周传雄") == [
-        "http://cdn/cand1.jpg", "http://cdn/cand2.jpg",
+        "http://t/1.jpg", "http://t/2.jpg",
     ]
 
 
@@ -195,15 +197,23 @@ def test_full_chain_falls_back_to_search(monkeypatch):
         seen.append(url)
         if "bing.com" in url:
             return BING_PAGE
-        if "cand1" in url:
+        if "t/1.jpg" in url:
             return small
-        if "cand2" in url:
+        if "t/2.jpg" in url:
             return good
         raise AssertionError(f"unexpected URL: {url}")
 
     monkeypatch.setattr(avatar_mod, "_browser_get", fake_browser)
-    assert avatar_mod.fetch_artist_avatar("周传雄") == good
-    assert any("cand2" in u for u in seen)
+    result = avatar_mod.fetch_artist_avatar("周传雄")
+    assert result is not None and result != good  # re-encoded to a small clean JPEG
+    assert any("t/2.jpg" in u for u in seen)
+    import io
+
+    from PIL import Image
+
+    img = Image.open(io.BytesIO(result))
+    assert max(img.size) <= avatar_mod._RENDER_MAX_EDGE
+    assert min(img.size) >= avatar_mod._MIN_SEARCH_EDGE
 
 
 def test_worker_emits_per_name_and_finishes(qapp, monkeypatch):
@@ -405,3 +415,127 @@ def test_search_image_data_strips_iccp_and_qt_stays_silent(monkeypatch, qapp):
     assert result is not None
     assert b"iCCP" not in _chunk_types(result)
     assert _icc_warnings(result) == []
+
+
+def test_strip_png_iccp_removes_duplicate_exif():
+    import struct
+    import zlib
+
+    ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    idat = zlib.compress(b"\x00\x12\x34\x56")
+    exif = b"Exif\0\0fake-exif-payload"
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"eXIf", exif)
+        + _png_chunk(b"eXIf", exif)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+    stripped = avatar_mod.strip_png_iccp(png)
+    assert _chunk_types(stripped) == [b"IHDR", b"eXIf", b"IDAT", b"IEND"]
+
+
+# --- JPEG APP2 ICC stripping --------------------------------------------
+def _jpeg_markers(data: bytes) -> list[int]:
+    """Segment markers (0xXX of 0xFFXX) of a JPEG, up to the image data."""
+    markers, i = [], 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        markers.append(marker)
+        if marker == 0xDA:
+            break
+        if marker == 0x00 or 0xD0 <= marker <= 0xD9:
+            i += 2
+            continue
+        length = int.from_bytes(data[i + 2 : i + 4], "big")
+        if length < 2 or i + 2 + length > len(data):
+            break
+        i += 2 + length
+    return markers
+
+
+def test_strip_jpeg_icc_removes_app2(qapp):
+    import io
+    import os
+
+    from PIL import Image
+
+    img = Image.frombytes("RGB", (120, 120), os.urandom(120 * 120 * 3))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", icc_profile=_trigger_profile())
+    jpeg = buf.getvalue()
+    assert 0xE2 in _jpeg_markers(jpeg)  # fixture: PIL embedded the profile
+    stripped = avatar_mod.strip_jpeg_icc(jpeg)
+    assert 0xE2 not in _jpeg_markers(stripped)
+    before = Image.open(io.BytesIO(jpeg))
+    after = Image.open(io.BytesIO(stripped))
+    assert before.size == after.size
+
+
+def test_strip_jpeg_icc_passthrough_without_app2():
+    jpeg = _jpeg(100, 100)  # plain JPEG, no embedded profile
+    assert avatar_mod.strip_jpeg_icc(jpeg) is jpeg
+
+
+# --- normalize_avatar (clean + shrink) ----------------------------------
+def test_normalize_avatar_small_image_cleaned_not_reencoded():
+    png = _png_with_iccp()  # 1x1, far below the size limit
+    result = avatar_mod.normalize_avatar(png)
+    assert result is not None
+    assert _chunk_types(result) == [b"IHDR", b"gAMA", b"IDAT", b"IEND"]
+
+
+def test_normalize_avatar_large_image_shrunk():
+    import io
+    import os
+
+    from PIL import Image
+
+    img = Image.frombytes("RGB", (500, 500), os.urandom(500 * 500 * 3))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG")
+    jpeg = buf.getvalue()
+    result = avatar_mod.normalize_avatar(jpeg)
+    assert result is not None
+    assert result[:2] == b"\xff\xd8"  # re-encoded JPEG
+    assert len(result) < len(jpeg)
+    small = Image.open(io.BytesIO(result))
+    assert max(small.size) <= avatar_mod._RENDER_MAX_EDGE
+
+
+def test_normalize_avatar_garbage_returns_none():
+    assert avatar_mod.normalize_avatar(b"not an image at all" * 10) is None
+
+
+# --- AvatarRenderer (background decode + one-time migration) ------------
+def test_renderer_migrates_large_avatar(qapp, tmp_path):
+    from ezkaraoke.database import SongDatabase
+
+    db = SongDatabase(tmp_path / "songs.db")
+    small = _jpeg(100, 100)
+    big = _jpeg(500, 500, noisy=True)
+    db.set_avatar("小歌手", small)
+    db.set_avatar("大歌手", big)
+    emitted: list[tuple[str, bytes]] = []
+    done = []
+    renderer = avatar_mod.AvatarRenderer(["小歌手", "大歌手"], db.path)
+    renderer.rendered.connect(lambda batch: emitted.extend(batch))
+    renderer.finished_all.connect(lambda: done.append(True))
+    renderer.start()
+    deadline = time.time() + 15
+    while renderer.isRunning() and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert renderer.wait(5000)
+    for _ in range(100):  # flush queued cross-thread signals
+        qapp.processEvents()
+    assert [name for name, _ in emitted] == ["小歌手", "大歌手"]
+    by_name = dict(emitted)
+    assert by_name["小歌手"] == small  # under the limit: not re-encoded
+    assert len(by_name["大歌手"]) < len(big)  # shrunk clean JPEG
+    # The renderer persists the shrunken copy itself (off the GUI thread).
+    assert db.get_avatar("大歌手") == by_name["大歌手"]
+    assert db.get_avatar("小歌手") == small
+    assert done == [True]
+    db.close()

@@ -6,10 +6,11 @@ import sqlite3
 import time
 from pathlib import Path
 
+from ezkaraoke import paths
 from ezkaraoke.letters import LETTERS, compute_letter
 from ezkaraoke.library import Song
 
-DEFAULT_DB_PATH = Path.home() / ".local" / "share" / "ezkaraoke" / "songs.db"
+DEFAULT_DB_PATH = paths.database_file()
 AVATAR_RETRY_SECONDS = 86400  # failed avatar fetches may be retried after this
 
 SCHEMA = """
@@ -17,7 +18,8 @@ CREATE TABLE IF NOT EXISTS songs (
     path TEXT PRIMARY KEY,
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
-    letter TEXT NOT NULL
+    letter TEXT NOT NULL,
+    size INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_songs_artist ON songs(artist);
 CREATE INDEX IF NOT EXISTS idx_songs_letter ON songs(letter);
@@ -27,11 +29,14 @@ CREATE TABLE IF NOT EXISTS artists (
     avatar_tried INTEGER NOT NULL DEFAULT 0,
     avatar_tried_at REAL
 );
+CREATE TABLE IF NOT EXISTS favorites (
+    path TEXT PRIMARY KEY
+);
 """
 
 
 def _row_to_song(row: tuple) -> Song:
-    return Song(artist=row[0], title=row[1], path=row[2])
+    return Song(artist=row[0], title=row[1], path=row[2], size=row[3])
 
 
 class SongDatabase:
@@ -45,6 +50,9 @@ class SongDatabase:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(artists)")}
         if "avatar_tried_at" not in cols:
             self._conn.execute("ALTER TABLE artists ADD COLUMN avatar_tried_at REAL")
+        song_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(songs)")}
+        if "size" not in song_cols:
+            self._conn.execute("ALTER TABLE songs ADD COLUMN size INTEGER")
         self._conn.commit()
 
     def rebuild(self, songs: list[Song]) -> None:
@@ -56,8 +64,11 @@ class SongDatabase:
         with self._conn:
             self._conn.execute("DELETE FROM songs")
             self._conn.executemany(
-                "INSERT OR REPLACE INTO songs VALUES (?, ?, ?, ?)",
-                [(s.path, s.artist, s.title, compute_letter(s.title)) for s in songs],
+                "INSERT OR REPLACE INTO songs VALUES (?, ?, ?, ?, ?)",
+                [
+                    (s.path, s.artist, s.title, compute_letter(s.title), s.size)
+                    for s in songs
+                ],
             )
             self._conn.execute(
                 "DELETE FROM artists WHERE name NOT IN "
@@ -67,11 +78,15 @@ class SongDatabase:
                 "INSERT OR IGNORE INTO artists (name) "
                 "SELECT DISTINCT artist FROM songs"
             )
+            self._conn.execute(
+                "DELETE FROM favorites WHERE path NOT IN (SELECT path FROM songs)"
+            )
 
     def delete_song(self, path: str) -> None:
         """Remove one song; artists left without songs are dropped too."""
         with self._conn:
             self._conn.execute("DELETE FROM songs WHERE path = ?", (str(path),))
+            self._conn.execute("DELETE FROM favorites WHERE path = ?", (str(path),))
             self._conn.execute(
                 "DELETE FROM artists WHERE name NOT IN "
                 "(SELECT DISTINCT artist FROM songs)"
@@ -83,9 +98,16 @@ class SongDatabase:
 
     def all_songs(self) -> list[Song]:
         rows = self._conn.execute(
-            "SELECT artist, title, path FROM songs ORDER BY artist, title, path"
+            "SELECT artist, title, path, size FROM songs "
+            "ORDER BY artist, title, path"
         ).fetchall()
         return [_row_to_song(r) for r in rows]
+
+    def count_missing_sizes(self) -> int:
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM songs WHERE size IS NULL"
+        ).fetchone()
+        return row[0]
 
     def search(self, query: str) -> list[Song]:
         """Empty query -> all songs; else artist LIKE %q% OR title LIKE %q%.
@@ -97,9 +119,43 @@ class SongDatabase:
             return self.all_songs()
         pattern = f"%{q}%"
         rows = self._conn.execute(
-            "SELECT artist, title, path FROM songs "
+            "SELECT artist, title, path, size FROM songs "
             "WHERE artist LIKE ? OR title LIKE ? ORDER BY artist, title, path",
             (pattern, pattern),
+        ).fetchall()
+        return [_row_to_song(r) for r in rows]
+
+    def get_song(self, path: str) -> Song | None:
+        row = self._conn.execute(
+            "SELECT artist, title, path, size FROM songs WHERE path = ?", (path,)
+        ).fetchone()
+        return _row_to_song(row) if row is not None else None
+
+    def is_favorite(self, path: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM favorites WHERE path = ?", (str(path),)
+        ).fetchone()
+        return row is not None
+
+    def toggle_favorite(self, path: str) -> bool:
+        """Toggle a song's favorite flag; returns the new state."""
+        if self.is_favorite(path):
+            self._conn.execute("DELETE FROM favorites WHERE path = ?", (str(path),))
+            new_state = False
+        else:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO favorites VALUES (?)", (str(path),)
+            )
+            new_state = True
+        self._conn.commit()
+        return new_state
+
+    def favorite_songs(self) -> list[Song]:
+        """All favorited songs in library order (artist, title, path)."""
+        rows = self._conn.execute(
+            "SELECT s.artist, s.title, s.path, s.size FROM favorites f "
+            "JOIN songs s ON s.path = f.path "
+            "ORDER BY s.artist, s.title, s.path"
         ).fetchall()
         return [_row_to_song(r) for r in rows]
 
@@ -116,7 +172,7 @@ class SongDatabase:
 
     def songs_by_artist(self, artist: str) -> list[Song]:
         rows = self._conn.execute(
-            "SELECT artist, title, path FROM songs WHERE artist = ? "
+            "SELECT artist, title, path, size FROM songs WHERE artist = ? "
             "ORDER BY title, path",
             (artist,),
         ).fetchall()
@@ -124,7 +180,7 @@ class SongDatabase:
 
     def songs_by_letter(self, letter: str) -> list[Song]:
         rows = self._conn.execute(
-            "SELECT artist, title, path FROM songs WHERE letter = ? "
+            "SELECT artist, title, path, size FROM songs WHERE letter = ? "
             "ORDER BY artist, title, path",
             (letter,),
         ).fetchall()

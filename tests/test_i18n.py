@@ -94,6 +94,21 @@ def test_config_language_roundtrip(tmp_path):
     assert load_config(path).language == "zh"
 
 
+def test_config_web_port_roundtrip(tmp_path):
+    path = tmp_path / "config.json"
+    # Legacy config without web_port keeps the default.
+    path.write_text(json.dumps({"music_folder": "/m"}), encoding="utf-8")
+    assert load_config(path).web_port == 8848
+    save_config(Config(music_folder="/m", web_port=9000), path)
+    assert load_config(path).web_port == 9000
+    # Invalid values fall back to the default.
+    for bad in (0, -1, 65536, "8848", None, True):
+        path.write_text(
+            json.dumps({"music_folder": "/m", "web_port": bad}), encoding="utf-8"
+        )
+        assert load_config(path).web_port == 8848
+
+
 # ------------------------------------------------------------- select window
 
 def test_select_window_retranslate(qapp, tmp_path, monkeypatch):
@@ -105,7 +120,7 @@ def test_select_window_retranslate(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(
         "ezkaraoke.select_window.save_config", lambda cfg: saved.append(cfg)
     )
-    config = Config(music_folder="")
+    config = Config(music_folder="", web_port=0)
     controller = PlayerController()
     win = SelectWindow(controller, db, config)
     win.show()
@@ -124,6 +139,7 @@ def test_select_window_retranslate(qapp, tmp_path, monkeypatch):
         assert win.windowTitle() == "ezkaraoke · Song Selector"
         assert win._btn_append.text() == "Queue"
         assert win._song_table.horizontalHeaderItem(0).text() == "Artist"
+        assert win._song_table.horizontalHeaderItem(2).text() == "Size"
         assert win._artist_list.item(0).text() == "All (3)"
         assert win._btn_lang.text() == "中文"
 

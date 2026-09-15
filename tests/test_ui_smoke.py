@@ -62,7 +62,7 @@ def test_ui_smoke(qapp, tmp_path):
     assert select_win.isVisible(), "Select window should be visible"
 
     # Center table should have 10 rows
-    assert select_win._song_table.rowCount() == 10, "Song table should list all 10 songs"
+    assert select_win._song_model.rowCount() == 10, "Song table should list all 10 songs"
 
     # Artist list: "全部" + 3 artists = 4 items
     assert select_win._artist_list.count() == 4, "Artist list should have 4 items"

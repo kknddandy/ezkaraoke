@@ -16,7 +16,7 @@ from ezkaraoke.config import Config
 from ezkaraoke.database import SongDatabase
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
-from ezkaraoke.select_window import ROLE_SIZE, SelectWindow, format_size
+from ezkaraoke.select_window import SelectWindow, format_size
 
 SONGS = [
     Song("周杰伦", "晴天", "/music/周杰伦-晴天.mp4"),
@@ -31,6 +31,12 @@ SONGS = [
     Song("林俊杰", "修炼爱情", "/music/林俊杰-修炼爱情.mp4"),
 ]
 
+
+
+def table_rows(win) -> list[Song]:
+    """Songs currently displayed in the song table, in display order."""
+    model = win._song_model
+    return [model.song_at(i) for i in range(model.rowCount())]
 
 @pytest.fixture(scope="session")
 def qapp():
@@ -64,7 +70,7 @@ def test_default_state(win):
     assert not win._letter_list.isVisible()
     assert win._artist_list.count() == 4  # 全部 + 3 artists
     assert win._artist_list.item(0).text().startswith("全部 (10)")
-    assert win._song_table.rowCount() == 10
+    assert win._song_model.rowCount() == 10
     for i in range(win._artist_list.count()):
         icon = win._artist_list.item(i).icon()
         assert icon is not None and not icon.isNull()  # placeholder pixmaps
@@ -79,9 +85,9 @@ def test_select_artist_filters_table(win):
     assert item.data(Qt.UserRole) == "周杰伦"
     win._artist_list.setCurrentItem(item)
     assert win._current_artist == "周杰伦"
-    assert win._song_table.rowCount() == 4
+    assert win._song_model.rowCount() == 4
     win._artist_list.setCurrentItem(win._artist_list.item(0))  # back to 全部
-    assert win._song_table.rowCount() == 10
+    assert win._song_model.rowCount() == 10
 
 
 def test_placeholder_label_shows_pinyin_letter(qapp):
@@ -167,16 +173,16 @@ def test_select_letter_filters_table(win):
         if win._letter_list.item(i).data(Qt.UserRole) == "Q":
             win._letter_list.setCurrentItem(win._letter_list.item(i))
     assert win._current_letter == "Q"
-    assert win._song_table.rowCount() == 2  # 晴天 + 七里香
+    assert win._song_model.rowCount() == 2  # 晴天 + 七里香
 
 
 def test_search_overrides_mode(win):
     win._btn_mode_letter.click()
     win._search_edit.setText("林")
-    assert win._song_table.rowCount() == 3  # 林俊杰's songs regardless of mode
+    assert win._song_model.rowCount() == 3  # 林俊杰's songs regardless of mode
     win._search_edit.clear()
     # back to letter mode with no letter selected -> all songs
-    assert win._song_table.rowCount() == 10
+    assert win._song_model.rowCount() == 10
 
 
 def test_rebuild_updates_lists_and_table(win, qapp, monkeypatch):
@@ -187,7 +193,7 @@ def test_rebuild_updates_lists_and_table(win, qapp, monkeypatch):
     win._on_scan_finished(new_songs)
     assert win._artist_list.count() == 2  # 全部 + 张学友
     assert win._artist_list.item(1).text() == "张学友 (1)"
-    assert win._song_table.rowCount() == 1
+    assert win._song_model.rowCount() == 1
     assert win._db.song_count() == 1
     # wait for the avatar worker to finish (no network behind the stub)
     worker = win._avatar_worker
@@ -216,11 +222,12 @@ def test_avatar_fetched_persists_and_marks_tried(win):
 def test_table_has_size_column_no_filename(win):
     # 3 real columns + a trailing spacer that keeps the size column's
     # resize handle off the splitter at the table's right edge.
-    assert win._song_table.columnCount() == 4
-    assert win._song_table.horizontalHeaderItem(0).text() == "歌手"
-    assert win._song_table.horizontalHeaderItem(1).text() == "歌名"
-    assert win._song_table.horizontalHeaderItem(2).text() == "文件尺寸"
-    assert win._song_table.horizontalHeaderItem(3).text() == ""
+    model = win._song_model
+    assert model.columnCount() == 4
+    assert model.headerData(0, Qt.Horizontal) == "歌手"
+    assert model.headerData(1, Qt.Horizontal) == "歌名"
+    assert model.headerData(2, Qt.Horizontal) == "文件尺寸"
+    assert model.headerData(3, Qt.Horizontal) == ""
     header = win._song_table.horizontalHeader()
     assert header.sectionResizeMode(2) == QHeaderView.Interactive
     assert header.sectionResizeMode(3) == QHeaderView.Fixed
@@ -244,33 +251,31 @@ def test_size_column_shows_and_sorts_numerically(win):
     ]
     win._db.rebuild(sized)
     win._refresh_song_table()
-    assert win._song_table.item(0, 2).text() != "—"
+    model = win._song_model
+    assert model.data(model.index(0, 2)) != "—"
 
     win._on_header_clicked(2)  # ascending by byte count
-    sizes = [
-        win._song_table.item(i, 0).data(ROLE_SIZE)
-        for i in range(win._song_table.rowCount())
-    ]
+    sizes = [s.size for s in table_rows(win)]
     assert sizes == sorted(sizes)
     assert sizes[0] == 1024 * 1024
 
 
 def test_header_click_sorts_artist_by_pinyin(win):
     win._on_header_clicked(0)
-    artists = [win._song_table.item(i, 0).text() for i in range(win._song_table.rowCount())]
+    artists = [s.artist for s in table_rows(win)]
     # pinyin order: deng < lin < zhou (codepoint order would be zhou < lin < deng)
     assert artists == ["邓紫棋"] * 3 + ["林俊杰"] * 3 + ["周杰伦"] * 4
     assert win._song_table.horizontalHeader().isSortIndicatorShown()
     # clicking the same header again reverses the order
     win._on_header_clicked(0)
-    artists = [win._song_table.item(i, 0).text() for i in range(win._song_table.rowCount())]
+    artists = [s.artist for s in table_rows(win)]
     assert artists[0] == "周杰伦"
     assert artists[-1] == "邓紫棋"
 
 
 def test_header_click_sorts_title_by_pinyin(win):
     win._on_header_clicked(1)
-    titles = [win._song_table.item(i, 1).text() for i in range(win._song_table.rowCount())]
+    titles = [s.title for s in table_rows(win)]
     assert titles == [
         "倒数", "稻香", "光年之外", "江南", "可惜没如果",
         "泡沫", "七里香", "晴天", "修炼爱情", "夜曲",
@@ -382,6 +387,14 @@ def test_startup_not_blocked_by_large_avatars(qapp, tmp_path, monkeypatch):
     big = buf.getvalue()
     for name in db.artists():
         db.set_avatar(name, big)
+    # Simulate a pre-0.3 library: oversized cached avatars that were never
+    # flagged normalized, so the renderer must decode + migrate them.
+    import sqlite3
+
+    con = sqlite3.connect(tmp_path / "songs.db")
+    con.execute("UPDATE artists SET normalized = 0")
+    con.commit()
+    con.close()
     controller = PlayerController()
     t0 = time.monotonic()
     window = SelectWindow(controller, db, Config(music_folder="", web_port=0))
@@ -430,9 +443,10 @@ def _row_center(win, title: str):
     from PySide6.QtCore import QPoint
 
     table = win._song_table
-    for r in range(table.rowCount()):
-        if table.item(r, 1) is not None and table.item(r, 1).text() == title:
-            return QPoint(table.visualItemRect(table.item(r, 1)).center())
+    model = table.model()
+    for r in range(model.rowCount()):
+        if model.song_at(r).title == title:
+            return QPoint(table.visualRect(model.index(r, 1)).center())
     raise AssertionError(f"no row with title {title}")
 
 
@@ -468,7 +482,7 @@ def test_context_menu_permanent_delete(qapp, tmp_path, monkeypatch):
         assert window._db.song_count() == 1
         assert window._db.artists() == ["邓紫棋"]
         assert len(controller.queue) == 0  # queued copy removed
-        assert window._song_table.rowCount() == 1
+        assert window._song_model.rowCount() == 1
         assert "1 首" in window._status_left.text()
         assert removed_cache_calls == [str(f1)]
     finally:
@@ -583,9 +597,9 @@ def test_append_to_playing_queue_does_not_restart(qapp, win):
 def _select_song_row(win, title: str) -> None:
     """Select the song table row whose title is *title* (order-agnostic)."""
     table = win._song_table
-    for r in range(table.rowCount()):
-        item = table.item(r, 1)
-        if item is not None and item.text() == title:
+    model = table.model()
+    for r in range(model.rowCount()):
+        if model.song_at(r).title == title:
             table.selectRow(r)
             return
     raise AssertionError(f"no table row with title {title}")
@@ -701,8 +715,9 @@ def test_queue_heart_survives_refresh(qapp, win):
 def test_queue_all_favorites_button_adds_missing_songs(qapp, win):
     for title in ("晴天", "光年之外", "江南"):
         _select_song_row(win, title)
-        row = win._song_table.currentRow()
-        win._db.toggle_favorite(win._song_table.item(row, 0).data(Qt.UserRole))
+        model = win._song_model
+        row = win._song_table.currentIndex().row()
+        win._db.toggle_favorite(model.song_at(row).path)
     _select_song_row(win, "晴天")
     win._btn_append.click()
     qapp.processEvents()
@@ -721,6 +736,46 @@ def test_queue_all_favorites_button_adds_missing_songs(qapp, win):
 def test_queue_all_favorites_none(qapp, win):
     win._btn_queue_favs.click()
     assert win._status_bar.currentMessage() == "没有红心歌曲"
+
+
+def test_queue_selection_restored_by_path_not_title(qapp, win):
+    # Regression: selection was preserved by title text, so two queued
+    # songs sharing a title (covers) both got reselected after refresh.
+    c = win._controller
+    extras = [
+        Song("周杰伦", "朋友", "/music/周杰伦-朋友.mp4"),
+        Song("邓紫棋", "朋友", "/music/邓紫棋-朋友.mp4"),
+    ]
+    win._db.rebuild([*win._db.all_songs(), *extras])
+    win._refresh_song_table()
+    c.append(extras[0])
+    c.append(extras[1])
+    qapp.processEvents()
+    win._queue_table.selectRow(0)  # 周杰伦-朋友 only
+    win._refresh_queue()
+    selected = [i.row() for i in win._queue_table.selectionModel().selectedRows()]
+    assert selected == [0]
+    win._controller.stop()
+    qapp.processEvents()
+def test_queue_title_starting_with_play_marker_not_mangled(qapp, win):
+    # Regression: the "▶ " marker was stripped from the cell text on every
+    # refresh, so a title that itself starts with "▶ " lost its prefix.
+    c = win._controller
+    song = Song("周杰伦", "▶ 特别", "/music/周杰伦-特别.mp4")
+    filler = Song("邓紫棋", "泡沫", "/music/邓紫棋-泡沫.mp4")
+    win._db.rebuild([*win._db.all_songs(), song])
+    win._refresh_song_table()
+    c.append(filler)  # row 0 (append never auto-plays)
+    c.append(song)    # row 1
+    qapp.processEvents()
+    assert win._queue_table.item(1, 2).text() == "▶ 特别"
+    c.play_at(1)  # current -> row 1 (synchronous); VLC error arrives later
+    assert win._queue_table.item(1, 2).text() == "▶ ▶ 特别"
+    c.stop()
+    qapp.processEvents()
+    # The raw title must survive the refresh; the old code stripped it
+    # down to "特别".
+    assert win._queue_table.item(1, 2).text() == "▶ 特别"
 
 
 def test_double_click_heart_cell_does_not_play(qapp, win):

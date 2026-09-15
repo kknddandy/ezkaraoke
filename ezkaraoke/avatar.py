@@ -385,11 +385,13 @@ class AvatarRenderer(threading.Thread):
     soon as it is ready, so the window opens instantly and photos pop in
     one by one.
 
-    Images larger than ``_RENDER_MAX_EDGE`` are re-encoded as small clean
-    JPEGs and the smaller copy is persisted by THIS worker (one-time
-    migration; also removes the embedded ICC / eXIf chunks that trigger
-    ``qt.gui.icc`` / ``libpng`` warnings). Writing here — thousands of
-    commits — keeps the GUI thread free of bulk DB I/O.
+    First pass over an un-normalized row decodes it: images larger than
+    ``_RENDER_MAX_EDGE`` are re-encoded as small clean JPEGs and the
+    smaller copy is persisted by THIS worker, cleaning-only rows are
+    persisted as cleaned copies, and every processed row is flagged
+    ``normalized = 1``. Later launches skip the decode entirely for
+    flagged rows (the fetch path flags avatars it normalized on arrival),
+    so steady-state startup is pure DB read + handoff, no decoding.
 
     Opens its own sqlite connection (read/write) — the main
     ``SongDatabase`` connection is bound to the GUI thread; WAL mode
@@ -435,19 +437,37 @@ class AvatarRenderer(threading.Thread):
         try:
             total = len(self.names)
             batch: list[tuple[str, bytes]] = []
+            # Databases created outside SongDatabase (tests) may lack the
+            # flag column; fall back to the old always-decode path.
+            have_flag = "normalized" in {
+                r[1] for r in conn.execute("PRAGMA table_info(artists)")
+            }
 
             def persist(name: str, small: bytes) -> None:
                 try:
                     conn.execute(
-                        "INSERT INTO artists (name, avatar, avatar_tried, avatar_tried_at) "
-                        "VALUES (?, ?, 1, ?) "
+                        "INSERT INTO artists "
+                        "(name, avatar, avatar_tried, avatar_tried_at, normalized) "
+                        "VALUES (?, ?, 1, ?, 1) "
                         "ON CONFLICT(name) DO UPDATE SET avatar = excluded.avatar, "
-                        "avatar_tried = 1, avatar_tried_at = excluded.avatar_tried_at",
+                        "avatar_tried = 1, avatar_tried_at = excluded.avatar_tried_at, "
+                        "normalized = 1",
                         (name, small, time.time()),
                     )
                     conn.commit()
                 except sqlite3.Error:
-                    pass  # icon still updates; the shrink retries on next launch
+                    pass  # icon still updates; the pass retries on next launch
+
+            def mark_normalized(name: str) -> None:
+                if not have_flag:
+                    return
+                try:
+                    conn.execute(
+                        "UPDATE artists SET normalized = 1 WHERE name = ?", (name,)
+                    )
+                    conn.commit()
+                except sqlite3.Error:
+                    pass
 
             def flush() -> None:
                 if batch:
@@ -457,16 +477,27 @@ class AvatarRenderer(threading.Thread):
             for done, name in enumerate(self.names, 1):
                 if self._stop.is_set():
                     break
-                row = conn.execute(
-                    "SELECT avatar FROM artists WHERE name = ?", (name,)
-                ).fetchone()
+                if have_flag:
+                    row = conn.execute(
+                        "SELECT avatar, normalized FROM artists WHERE name = ?",
+                        (name,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT avatar, 0 FROM artists WHERE name = ?", (name,)
+                    ).fetchone()
                 data = row[0] if row else None
                 if data:
-                    small = normalize_avatar(data)
-                    if small is None:
-                        small = clean_image_data(data)
-                    elif len(small) < len(data) and small != data:
-                        persist(name, small)  # one-time shrink, off the GUI thread
+                    if row[1]:
+                        small = data  # already cleaned + shrunk: skip the decode
+                    else:
+                        small = normalize_avatar(data)
+                        if small is None:
+                            small = clean_image_data(data)
+                        if small != data:
+                            persist(name, small)  # shrunk/cleaned, off the GUI thread
+                        else:
+                            mark_normalized(name)
                     batch.append((name, small))
                     if len(batch) >= _RENDER_BATCH:
                         flush()

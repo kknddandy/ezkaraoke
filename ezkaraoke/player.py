@@ -424,6 +424,103 @@ class PlayerController(QObject):
             self.current_changed.emit(self._current_index)
         self.queue_changed.emit()
 
+    def move_rows(self, rows: list[int], delta: int) -> None:
+        """Shift the queue rows in *rows* by one step toward *delta* (clamped).
+
+        Each consecutive run of selected rows shifts as one unit: the row
+        just beyond the run's moving edge rotates into the run's vacated
+        slot, and a run already at the queue boundary stays put.
+        Batched: regardless of how many rows move, the queue table
+        refreshes once and at most one ``current_changed`` fires. For
+        arbitrary-distance moves of one row, use :meth:`move`; for "put
+        right after current", :meth:`jump_after_current`.
+        """
+        if not self._queue or delta == 0:
+            return
+        n = len(self._queue)
+        selected = {i for i in rows if 0 <= i < n}
+        if not selected:
+            return
+        moved = list(self._queue)
+        if delta < 0:
+            idx = 0
+            while idx < n:
+                if idx not in selected:
+                    idx += 1
+                    continue
+                start = idx
+                while start + 1 < n and start + 1 in selected:
+                    start += 1
+                if idx > 0:
+                    # Run shifts up one; the row above drops to its end.
+                    moved[idx - 1 : start + 1] = moved[idx : start + 1] + [
+                        moved[idx - 1]
+                    ]
+                idx = start + 1
+        else:
+            idx = n - 1
+            while idx >= 0:
+                if idx not in selected:
+                    idx -= 1
+                    continue
+                end = idx
+                while end - 1 >= 0 and end - 1 in selected:
+                    end -= 1
+                if idx < n - 1:
+                    # Run shifts down one; the row below rises to its start.
+                    moved[end : idx + 2] = [moved[idx + 1]] + moved[end : idx + 1]
+                idx = end - 1
+        if [s.path for s in moved] == [s.path for s in self._queue]:
+            return
+        old_current = self._current_index
+        current_song = (
+            self._queue[old_current] if 0 <= old_current < n else None
+        )
+        self._queue = moved
+        if current_song is not None:
+            self._current_index = next(
+                i for i, s in enumerate(moved) if s is current_song
+            )
+        if self._current_index != old_current:
+            self.current_changed.emit(self._current_index)
+        self.queue_changed.emit()
+
+    def remove_rows(self, rows: list[int]) -> None:
+        """Remove all queue rows in *rows* in one pass.
+
+        If the playing row is among them, playback continues with the
+        next surviving song (first survivor after the removed row, or the
+        last survivor when nothing followed it); with nothing left,
+        playback stops. The queue table refreshes once.
+        """
+        n = len(self._queue)
+        valid = {i for i in rows if 0 <= i < n}
+        if not valid:
+            return
+        removing_current = 0 <= self._current_index < n and self._current_index in valid
+        old_current = self._current_index
+        next_song = None
+        if removing_current:
+            after = [i for i in range(old_current + 1, n) if i not in valid]
+            before = [i for i in range(old_current) if i not in valid]
+            target = after[0] if after else (before[-1] if before else None)
+            if target is not None:
+                next_song = self._queue[target]
+        self._queue = [s for i, s in enumerate(self._queue) if i not in valid]
+        if removing_current:
+            if next_song is not None:
+                self._stop_vlc()
+                self._begin_play(
+                    next(i for i, s in enumerate(self._queue) if s is next_song)
+                )
+            else:
+                self.stop()
+        else:
+            if 0 <= old_current:
+                self._current_index = old_current - sum(1 for i in valid if i < old_current)
+                self.current_changed.emit(self._current_index)
+        self.queue_changed.emit()
+
     def jump_after_current(self, indices: list[int]) -> None:
         """Move the queue rows at *indices* right after the playing song.
 

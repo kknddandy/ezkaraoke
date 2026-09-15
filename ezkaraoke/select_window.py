@@ -1,6 +1,14 @@
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QPoint, QRect, QSize, Qt
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -27,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -84,23 +93,100 @@ def make_placeholder_pixmap(text: str, size: int = 40) -> QPixmap:
     painter.end()
     return pixmap
 
+class _SongTableModel(QAbstractTableModel):
+    """Song table rows: the currently displayed songs in display order.
 
-class _SongItem(QTableWidgetItem):
-    """Song table cell with a pinyin-aware sort key (Chinese order)."""
+    Sorting happens in Python (pinyin keys), because Qt's built-in text
+    comparison does not match Chinese order. The trailing invisible
+    spacer column keeps the 文件尺寸 resize handle off the table's right
+    edge (see the construction site).
+    """
 
-    def __init__(self, text: str, key: list[str]) -> None:
-        super().__init__(text)
-        self._sort_key = key
+    COLUMNS = 4  # 歌手 / 歌名 / 文件尺寸 / spacer
 
-    def __lt__(self, other) -> bool:
-        if isinstance(other, _SongItem):
-            return self._sort_key < other._sort_key
-        return super().__lt__(other)
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._songs: list[Song] = []
+
+    # ------------------------------------------------------------- data
+    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._songs)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 0 if parent.isValid() else self.COLUMNS
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        song = self._songs[index.row()]
+        col = index.column()
+        if col == self.COLUMNS - 1:
+            return None  # trailing spacer
+        if role == Qt.DisplayRole:
+            if col == 0:
+                return song.artist
+            if col == 1:
+                return song.title
+            return format_size(song.size)
+        if role == Qt.TextAlignmentRole and col == 2:
+            return int(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+        if role == Qt.UserRole and col == 0:
+            return song.path
+        return None
+
+    def headerData(self, section: int, orientation, role: int = Qt.DisplayRole):
+        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+            return (tr("歌手"), tr("歌名"), tr("文件尺寸"), "")[section]
+        return None
+
+    def retranslate(self) -> None:
+        """Re-emit the horizontal header labels in the active language."""
+        self.headerDataChanged.emit(
+            Qt.Horizontal, 0, self.COLUMNS - 1
+        )
+
+    # -------------------------------------------------------- mutations
+    def set_songs(self, songs: list[Song]) -> None:
+        self.beginResetModel()
+        self._songs = list(songs)
+        self.endResetModel()
+
+    def sort(self, column: int, order) -> None:
+        """Reorder rows in place (display-role keys, pinyin-aware)."""
+        if not self._songs:
+            return
+        if column == 2:
+            # Size (bytes) primary, missing sizes last; artist as tie-break.
+            key = lambda s: (  # noqa: E731
+                (s.size if s.size is not None else -1),
+                pinyin_key(s.artist) + [s.artist],
+                s.artist,
+            )
+        elif column == 1:
+            key = lambda s: (  # noqa: E731
+                pinyin_key(s.title) + [s.title],
+                pinyin_key(s.artist) + [s.artist],
+            )
+        else:
+            key = lambda s: (  # noqa: E731
+                pinyin_key(s.artist) + [s.artist],
+                pinyin_key(s.title) + [s.title],
+            )
+        self.beginResetModel()
+        self._songs.sort(key=key, reverse=(order == Qt.SortOrder.DescendingOrder))
+        self.endResetModel()
+
+    def song_at(self, row: int) -> Song | None:
+        if 0 <= row < len(self._songs):
+            return self._songs[row]
+        return None
 
 
-# Raw file size in bytes, stored per row for numeric sorting (the visible
-# text is human-formatted and not sortable on its own).
-ROLE_SIZE = Qt.UserRole + 1
+# Raw title of the queue row; kept on the title cell so the "▶ " marker
+# stays display-only (the cell text is rewritten on every refresh).
+QUEUE_ROLE_TITLE = Qt.UserRole + 2
 
 
 def format_size(size: int | None) -> str:
@@ -192,6 +278,13 @@ class SelectWindow(QMainWindow):
         self._avatar_worker: AvatarWorker | None = None
         self._avatar_renderer: AvatarRenderer | None = None
         self._size_worker: SizeBackfillWorker | None = None
+        # A rescan must not start while a size backfill is writing to the
+        # songs table (SQLite lock contention); instead of blocking the GUI
+        # thread on the backfill, a short timer starts the scan as soon as
+        # the backfill exits. See _start_scan.
+        self._scan_defer_timer = QTimer(self)
+        self._scan_defer_timer.setInterval(200)
+        self._scan_defer_timer.timeout.connect(self._try_begin_scan)
         self._mode: str = "artist"
         self._current_artist: str | None = None
         self._current_letter: str | None = None
@@ -305,12 +398,10 @@ class SelectWindow(QMainWindow):
         # A trailing fixed-width spacer keeps the 文件尺寸 resize handle off
         # the table's right edge; otherwise it sits under the 4px splitter
         # handle and dragging there resizes the splitter, not the column.
-        self._song_table = QTableWidget(self)
+        self._song_model = _SongTableModel(self)
+        self._song_table = QTableView(self)
         self._song_table.setObjectName("SongTable")
-        self._song_table.setColumnCount(4)
-        self._song_table.setHorizontalHeaderLabels(
-            [tr("歌手"), tr("歌名"), tr("文件尺寸"), ""]
-        )
+        self._song_table.setModel(self._song_model)
         header = self._song_table.horizontalHeader()
         header.setMinimumSectionSize(20)
         header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -322,20 +413,27 @@ class SelectWindow(QMainWindow):
         self._song_table.setColumnWidth(3, 20)
         # Comfortable breathing room around the 28px display font
         self._song_table.verticalHeader().setDefaultSectionSize(52)
-        # Manual pinyin-aware sorting: Qt's built-in sort compares raw text
-        # (and PySide ignores QTableWidgetItem.__lt__), so we sort in Python
-        # by pinyin key and re-fill the table.
+        # Manual pinyin-aware sorting: Qt's built-in sort compares raw
+        # text, so we sort by pinyin keys in Python (see _SongTableModel).
         self._sort_column: int | None = None
         self._sort_order = Qt.SortOrder.AscendingOrder
         self._song_table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
-        self._song_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._song_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self._song_table.setSelectionBehavior(
+            QTableWidget.SelectRows
+        )
+        self._song_table.setSelectionMode(
+            QTableWidget.ExtendedSelection
+        )
         self._song_table.setAlternatingRowColors(True)
-        self._song_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._song_table.setEditTriggers(
+            QTableWidget.NoEditTriggers
+        )
         self._song_table.doubleClicked.connect(self._on_song_double_clicked)
         # Re-enable the action buttons as soon as the user (de)selects rows;
         # without this they stay disabled until the next table refresh.
-        self._song_table.itemSelectionChanged.connect(self._update_button_states)
+        self._song_table.selectionModel().selectionChanged.connect(
+            self._update_button_states
+        )
         self._song_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._song_table.customContextMenuRequested.connect(self._on_song_context_menu)
         center_layout.addWidget(self._song_table, stretch=1)
@@ -520,9 +618,7 @@ class SelectWindow(QMainWindow):
         self._btn_rescan.setText(tr("重新扫描"))
         self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
         self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
-        self._song_table.setHorizontalHeaderLabels(
-            [tr("歌手"), tr("歌名"), tr("文件尺寸"), ""]
-        )
+        self._song_model.retranslate()
         self._btn_append.setText(tr("点歌"))
         self._btn_insert.setText(tr("插入播放"))
         self._btn_play_now.setText(tr("立即播放"))
@@ -599,11 +695,24 @@ class SelectWindow(QMainWindow):
     def _start_scan(self) -> None:
         if self._scan_worker is not None and self._scan_worker.isRunning():
             return
-        # A rescan rebuilds the songs table; let the one-shot size backfill
-        # finish first so the two writers don't contend for the SQLite lock.
+        # A rescan rebuilds the songs table; it must not start while the
+        # one-shot size backfill is still writing (SQLite lock contention).
+        # Defer with a short timer instead of blocking the GUI thread on
+        # worker.wait() — the backfill terminates on its own (finite rows),
+        # so the timer picks the scan up within ~200 ms of it finishing.
         if self._size_worker is not None and self._size_worker.isRunning():
-            self._size_worker.stop()
-            self._size_worker.wait()
+            if not self._scan_defer_timer.isActive():
+                self._scan_defer_timer.start()
+            return
+        self._begin_scan()
+
+    def _try_begin_scan(self) -> None:
+        if self._size_worker is not None and self._size_worker.isRunning():
+            return
+        self._scan_defer_timer.stop()
+        self._begin_scan()
+
+    def _begin_scan(self) -> None:
         folder = self._config.music_folder
         if not folder:
             self._status_left.setText(tr("请先设置音乐文件夹"))
@@ -763,29 +872,13 @@ class SelectWindow(QMainWindow):
         return self._db.all_songs()
 
     def _refresh_song_table(self) -> None:
-        songs = self._get_displayed_songs()
-        table = self._song_table
-        table.setRowCount(len(songs))
-        for row, song in enumerate(songs):
-            artist_item = _SongItem(song.artist, pinyin_key(song.artist) + [song.artist])
-            artist_item.setData(Qt.UserRole, song.path)
-            artist_item.setData(ROLE_SIZE, song.size)
-            table.setItem(row, 0, artist_item)
-            table.setItem(row, 1, _SongItem(song.title, pinyin_key(song.title) + [song.title]))
-            table.setItem(row, 2, self._size_item(song.size))
+        self._song_model.set_songs(self._get_displayed_songs())
         if self._sort_column is not None:
             self._sort_table()
         self._update_button_states()
 
-    def _size_item(self, size: int | None) -> QTableWidgetItem:
-        item = QTableWidgetItem(format_size(size))
-        item.setTextAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        return item
-
     def _on_header_clicked(self, column: int) -> None:
-        if column >= self._song_table.columnCount() - 1:
+        if column >= self._song_table.model().columnCount() - 1:
             return  # trailing spacer: not a sortable column
         if self._sort_column == column:
             self._sort_order = (
@@ -799,42 +892,8 @@ class SelectWindow(QMainWindow):
         self._sort_table()
 
     def _sort_table(self) -> None:
-        table = self._song_table
-        rows = []
-        for r in range(table.rowCount()):
-            artist_item = table.item(r, 0)
-            title_item = table.item(r, 1)
-            if artist_item is None or title_item is None:
-                continue
-            rows.append(
-                (
-                    pinyin_key(artist_item.text()),
-                    pinyin_key(title_item.text()),
-                    artist_item.text(),
-                    title_item.text(),
-                    artist_item.data(Qt.UserRole),
-                    artist_item.data(ROLE_SIZE),
-                )
-            )
-        col = self._sort_column
-        if col == 2:
-            # Size (bytes) primary, missing sizes last; artist order as tie-break.
-            key = lambda r: ((r[5] if r[5] is not None else -1), r[0], r[2])
-        elif col == 1:
-            key = lambda r: (r[1], r[0])
-        else:
-            key = lambda r: (r[0], r[1])
-        rows.sort(key=key, reverse=self._sort_order == Qt.SortOrder.DescendingOrder)
-        table.setRowCount(0)
-        table.setRowCount(len(rows))
-        for r, (akey, tkey, artist, title, path, size) in enumerate(rows):
-            artist_item = _SongItem(artist, akey + [artist])
-            artist_item.setData(Qt.UserRole, path)
-            artist_item.setData(ROLE_SIZE, size)
-            table.setItem(r, 0, artist_item)
-            table.setItem(r, 1, _SongItem(title, tkey + [title]))
-            table.setItem(r, 2, self._size_item(size))
-        header = table.horizontalHeader()
+        self._song_model.sort(self._sort_column, self._sort_order)
+        header = self._song_table.horizontalHeader()
         header.setSortIndicatorShown(True)
         header.setSortIndicator(self._sort_column, self._sort_order)
 
@@ -844,22 +903,11 @@ class SelectWindow(QMainWindow):
 
     def _selected_songs(self) -> list[Song]:
         # Read from the (possibly user-sorted) rows, not the query order.
-        songs = []
-        rows = sorted(set(idx.row() for idx in self._song_table.selectionModel().selectedRows()))
-        for row in rows:
-            artist_item = self._song_table.item(row, 0)
-            title_item = self._song_table.item(row, 1)
-            if artist_item is None or title_item is None:
-                continue
-            songs.append(
-                Song(
-                    artist_item.text(),
-                    title_item.text(),
-                    artist_item.data(Qt.UserRole),
-                    size=artist_item.data(ROLE_SIZE),
-                )
-            )
-        return songs
+        rows = sorted(
+            {idx.row() for idx in self._song_table.selectionModel().selectedRows()}
+        )
+        songs = [self._song_model.song_at(row) for row in rows]
+        return [s for s in songs if s is not None]
 
     def _append_selected(self) -> None:
         was_empty = not self._controller.queue
@@ -893,16 +941,14 @@ class SelectWindow(QMainWindow):
     # ===== Right-click: permanent delete =====
 
     def _on_song_context_menu(self, pos: QPoint) -> None:
-        row = self._song_table.rowAt(pos.y())
-        if row < 0:
+        index = self._song_table.indexAt(pos)
+        if not index.isValid():
             return
-        artist_item = self._song_table.item(row, 0)
-        title_item = self._song_table.item(row, 1)
-        path = artist_item.data(Qt.UserRole) if artist_item is not None else None
-        if artist_item is None or title_item is None or not path:
+        row = index.row()
+        song = self._song_model.song_at(row)
+        if song is None or not song.path:
             return
         self._song_table.selectRow(row)
-        song = Song(artist_item.text(), title_item.text(), path)
         menu = QMenu(self)
         delete_action = menu.addAction(tr("永久删除"))
         delete_action.setToolTip(tr("从磁盘删除视频文件：{path}", path=song.path))
@@ -1019,28 +1065,35 @@ class SelectWindow(QMainWindow):
     # ===== Queue table =====
 
     def _refresh_queue(self) -> None:
-        # Preserve selection by song title
-        old_selection = set()
+        # Preserve selection by song path (titles are not unique in a
+        # queue: covers and live versions share titles).
+        old_paths = set()
         for idx in self._queue_table.selectionModel().selectedRows():
             item = self._queue_table.item(idx.row(), 2)
-            if item:
-                old_selection.add(item.text().lstrip("▶ ").strip())
+            if item is not None:
+                path = item.data(Qt.UserRole)
+                if path is not None:
+                    old_paths.add(path)
 
         queue = self._controller.queue
         self._queue_table.setRowCount(len(queue))
         for row, song in enumerate(queue):
             self._set_queue_heart(row, song.path)
             self._queue_table.setItem(row, 1, QTableWidgetItem(song.artist))
-            title = f"▶ {song.title}" if row == self._controller.current_index else song.title
-            self._queue_table.setItem(row, 2, QTableWidgetItem(title))
+            title_item = QTableWidgetItem(
+                f"▶ {song.title}" if row == self._controller.current_index else song.title
+            )
+            title_item.setData(Qt.UserRole, song.path)
+            title_item.setData(QUEUE_ROLE_TITLE, song.title)
+            self._queue_table.setItem(row, 2, title_item)
 
         self._highlight_current_queue()
 
         # Restore selection where possible
-        if old_selection:
+        if old_paths:
             for row in range(self._queue_table.rowCount()):
                 item = self._queue_table.item(row, 2)
-                if item and item.text().lstrip("▶ ").strip() in old_selection:
+                if item is not None and item.data(Qt.UserRole) in old_paths:
                     self._queue_table.selectRow(row)
 
     def _set_queue_heart(self, row: int, path: str) -> None:
@@ -1071,11 +1124,13 @@ class SelectWindow(QMainWindow):
             title_item = self._queue_table.item(row, 2)
             if title_item is None:
                 continue
-            text = title_item.text().lstrip("▶ ").strip()
-            if row == current:
-                title_item.setText(f"▶ {text}")
-            else:
-                title_item.setText(text)
+            # The raw title lives in item data (QUEUE_ROLE_TITLE); the "▶ "
+            # marker is display-only, so a title that itself starts with
+            # "▶ " (or a space) is never mangled by re-stripping.
+            title = title_item.data(QUEUE_ROLE_TITLE)
+            if title is None:
+                title = title_item.text().lstrip("▶ ").strip()
+            title_item.setText(f"▶ {title}" if row == current else title)
 
         # Update status bar right
         song = self._controller.current_song
@@ -1131,24 +1186,16 @@ class SelectWindow(QMainWindow):
         self._controller.jump_after_current(rows)
 
     def _move_up(self) -> None:
-        rows = sorted(set(idx.row() for idx in self._queue_table.selectionModel().selectedRows()))
-        # Cumulative delta approach: move each selected row up by 1
-        # Process top-to-bottom, but since moving up shifts indices, we need to account
-        # Actually move top-to-bottom; if consecutive, moving the top one first is fine.
-        for row in rows:
-            if row > 0:
-                self._controller.move(row, -1)
+        rows = [idx.row() for idx in self._queue_table.selectionModel().selectedRows()]
+        self._controller.move_rows(rows, -1)
 
     def _move_down(self) -> None:
-        rows = sorted(set(idx.row() for idx in self._queue_table.selectionModel().selectedRows()), reverse=True)
-        for row in rows:
-            if row < len(self._controller.queue) - 1:
-                self._controller.move(row, 1)
+        rows = [idx.row() for idx in self._queue_table.selectionModel().selectedRows()]
+        self._controller.move_rows(rows, 1)
 
     def _remove_selected(self) -> None:
-        rows = sorted(set(idx.row() for idx in self._queue_table.selectionModel().selectedRows()), reverse=True)
-        for row in rows:
-            self._controller.remove_at(row)
+        rows = [idx.row() for idx in self._queue_table.selectionModel().selectedRows()]
+        self._controller.remove_rows(rows)
 
     def _on_status_message(self, message: str) -> None:
         self._status_bar.showMessage(tr(message), 5000)
@@ -1206,6 +1253,7 @@ class SelectWindow(QMainWindow):
         ):
             if worker is not None:
                 worker.stop()
+        self._scan_defer_timer.stop()
         self._web.stop()
         off_language_changed(self.retranslate)
         super().closeEvent(event)

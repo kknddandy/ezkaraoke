@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 LETTERS: list[str] = [chr(c) for c in range(ord("A"), ord("Z") + 1)] + ["#"]
 
 try:
@@ -39,15 +41,22 @@ def compute_letter(title: str) -> str:
     return "#"
 
 
+@lru_cache(maxsize=32768)
+def _cached_pinyin(text: str) -> tuple[str, ...]:
+    try:
+        return tuple(lazy_pinyin(text)) or (text,)
+    except Exception:  # noqa: BLE001 - pypinyin is best-effort
+        return (text,)
+
+
 def pinyin_key(text: str) -> list[str]:
     """Pinyin-aware sort key for *text* (toneless, per character).
 
     Non-CJK characters are kept as-is; falls back to the raw text when
     pypinyin is unavailable. List form so keys compare lexicographically.
+    Cached: table rebuilds re-derive the same artist/title strings on
+    every refresh, and pypinyin dominates that cost.
     """
     if not _PYPINYIN:
         return [text]
-    try:
-        return lazy_pinyin(text) or [text]
-    except Exception:  # noqa: BLE001 - pypinyin is best-effort
-        return [text]
+    return list(_cached_pinyin(text))

@@ -28,7 +28,8 @@ original/instrumental track switching and per-song pitch shift.
 - **Queue management** — move up/down, remove, double-click to play.
 - **Phone ordering** — a QR code on the podium points phones at a local
   web page (port 8848): search songs, add them to the queue, and control
-  playback from any device on the network.
+  playback from any device on the network. LAN-only by design: the page
+  has no authentication, so use it only on a trusted home network.
 - **Pitch shift (semitones, ±12)** — per-song key change; the preference
   is remembered across songs. VLC ≥ 4 does a pure pitch shift; with
   VLC < 4 the tempo changes as well.
@@ -142,7 +143,8 @@ The config holds the music folder, language and phone-ordering web port.
    phone on the same network. The web page shows the current queue and
    lets you search and add songs (the first song added to an empty queue
    starts playback) and control next / pause / clear. If port 8848 is
-    busy the panel reports it and the desktop UI keeps working.
+    busy the panel reports it and the desktop UI keeps working. The web
+    page is for a trusted home LAN only — it has no authentication.
 6. Player window:
     - `Space` play/pause
     - `F11`, the fullscreen button, or a double-click on the video
@@ -234,7 +236,8 @@ vendored at `ezkaraoke/_segno/`.
   直接播放。
 - **队列管理**：上移、下移、删除，双击队列歌曲立即切歌。
 - **手机扫码点歌**：点歌台队列面板顶部的二维码指向局域网网页
-  （端口 8848），手机可搜索点歌、查看队列并控制播放。
+  （端口 8848），手机可搜索点歌、查看队列并控制播放。该网页仅限可信的
+  家庭局域网使用——页面没有任何身份验证，请勿将 8848 端口暴露到公网。
 - **升调/降调**：半音步进变调（±12 半音，标签显示 原调/升N/降N），
   偏好跨歌曲保留；VLC ≥ 4 为纯变调，VLC < 4 变调的同时会改变速度。
 - **原唱/伴奏切换**：双音轨视频一键切换原唱与伴奏，播放窗口与点歌台
@@ -339,7 +342,7 @@ ezkaraoke
 5. 手机扫码点歌：用同一局域网内的手机扫描队列面板顶部的二维码，网页
    可显示当前队列、搜索点歌（空队列中第一首会自动开始播放）并控制
    上一首/播放暂停/下一首/清空。若 8848 端口被占用，面板会提示，
-   桌面端功能不受影响。
+   桌面端功能不受影响。该网页仅限可信的家庭局域网使用，没有任何身份验证。
 6. 播放器窗口：
    - `Space` 播放/暂停
    - `F11`、全屏按钮或双击视频切换无边框全屏；`Esc` 退出；约 2.5 秒

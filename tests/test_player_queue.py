@@ -412,6 +412,136 @@ def test_move_empty_queue_noop(qapp):
     assert p.queue == []
 
 
+
+# ----------------------------------------------------------------- move_rows
+def test_move_rows_consecutive_block_shifts_as_unit(qapp):
+    s1, s2, s3, s4, s5 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"),
+        make("D", "d1"), make("E", "e1"),
+    )
+    p = PlayerController()
+    for s in (s1, s2, s3, s4, s5):
+        p.append(s)
+    refreshes = []
+    p.queue_changed.connect(lambda: refreshes.append(1))
+
+    # Rows 2,3,4 form one block: it shifts up by one as a unit and the
+    # row above (s2) drops to the block's old end.
+    p.move_rows([2, 3, 4], -1)
+    assert paths(p.queue) == [s1.path, s3.path, s4.path, s5.path, s2.path]
+    assert refreshes == [1]  # one refresh no matter how many rows moved
+
+    p = PlayerController()
+    for s in (s1, s2, s3, s4, s5):
+        p.append(s)
+    # Block at rows 0,1 shifts down by one; the row below (s3) rises.
+    p.move_rows([0, 1], 1)
+    assert paths(p.queue) == [s3.path, s1.path, s2.path, s4.path, s5.path]
+
+
+def test_move_rows_non_consecutive_rows(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4, s5 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"),
+        make("D", "d1"), make("E", "e1"),
+    )
+    for s in (s1, s2, s3, s4, s5):
+        p.append(s)
+    p.move_rows([1, 3], -1)  # each isolated row swaps with its neighbor
+    assert paths(p.queue) == [s2.path, s1.path, s4.path, s3.path, s5.path]
+    p.move_rows([1, 3], 1)
+    assert paths(p.queue) == [s2.path, s4.path, s1.path, s5.path, s3.path]
+
+
+def test_move_rows_boundary_noop_emits_nothing(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    events = []
+    p.queue_changed.connect(lambda: events.append("q"))
+    p.current_changed.connect(lambda i: events.append("c"))
+    p.move_rows([0], -1)  # top row: already clamped
+    p.move_rows([2], 1)   # bottom row: already clamped
+    assert paths(p.queue) == [s1.path, s2.path, s3.path]
+    assert events == []
+
+
+def test_move_rows_current_inside_block_follows(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"), make("D", "d1")
+    )
+    for s in (s1, s2, s3, s4):
+        p.append(s)
+    p.play_at(1)  # current s2 at index 1
+    p.move_rows([1, 2], 1)  # s2,s3 block shifts down one; s4 rises to 1
+    assert paths(p.queue) == [s1.path, s4.path, s2.path, s3.path]
+    assert p.current_index == 2
+    assert p.current_song is s2
+
+    changed = []
+    p.current_changed.connect(changed.append)
+    p.move_rows([0, 1], -1)  # block touches the top edge: clamped, no move
+    assert paths(p.queue) == [s1.path, s4.path, s2.path, s3.path]
+    assert changed == []
+
+
+# --------------------------------------------------------------- remove_rows
+def test_remove_rows_multiple_non_current(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4, s5 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"),
+        make("D", "d1"), make("E", "e1"),
+    )
+    for s in (s1, s2, s3, s4, s5):
+        p.append(s)
+    p.play_at(1)  # current s2 at index 1
+    p.remove_rows([3, 4])
+    assert paths(p.queue) == [s1.path, s2.path, s3.path]
+    assert p.current_index == 1
+    assert p.current_song is s2
+
+
+def test_remove_rows_including_current_continues(qapp):
+    p = PlayerController()
+    s1, s2, s3, s4 = (
+        make("A", "a1"), make("B", "b1"), make("C", "c1"), make("D", "d1")
+    )
+    for s in (s1, s2, s3, s4):
+        p.append(s)
+    p.play_at(1)  # current s2 at index 1
+    p.remove_rows([0, 1])
+    # first survivor after the removed current (s3) plays immediately
+    assert paths(p.queue) == [s3.path, s4.path]
+    assert p.current_index == 0
+    assert p.current_song is s3
+
+
+def test_remove_rows_current_last_falls_back_to_last_survivor(qapp):
+    p = PlayerController()
+    s1, s2, s3 = make("A", "a1"), make("B", "b1"), make("C", "c1")
+    for s in (s1, s2, s3):
+        p.append(s)
+    p.play_at(2)  # current s3, the last row
+    p.remove_rows([0, 2])
+    # nothing survived after current: the last survivor (s2) plays
+    assert paths(p.queue) == [s2.path]
+    assert p.current_index == 0
+    assert p.current_song is s2
+
+
+def test_remove_rows_all_stops(qapp):
+    p = PlayerController()
+    s1, s2 = make("A", "a1"), make("B", "b1")
+    for s in (s1, s2):
+        p.append(s)
+    p.play_at(0)
+    p.remove_rows([0, 1])
+    assert p.queue == []
+    assert p.current_index == -1
+    assert not p.is_playing
+
 # ------------------------------------------------------ jump_after_current
 def test_jump_after_current_single(qapp):
     p = PlayerController()

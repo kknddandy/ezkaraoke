@@ -138,8 +138,8 @@ def test_select_window_retranslate(qapp, tmp_path, monkeypatch):
         assert saved and saved[-1].language == "en"
         assert win.windowTitle() == "ezkaraoke · Song Selector"
         assert win._btn_append.text() == "Queue"
-        assert win._song_table.horizontalHeaderItem(0).text() == "Artist"
-        assert win._song_table.horizontalHeaderItem(2).text() == "Size"
+        assert win._song_model.headerData(0, Qt.Horizontal) == "Artist"
+        assert win._song_model.headerData(2, Qt.Horizontal) == "Size"
         assert win._artist_list.item(0).text() == "All (3)"
         assert win._btn_lang.text() == "中文"
 

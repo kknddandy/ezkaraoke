@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS artists (
     name TEXT PRIMARY KEY,
     avatar BLOB,
     avatar_tried INTEGER NOT NULL DEFAULT 0,
-    avatar_tried_at REAL
+    avatar_tried_at REAL,
+    normalized INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS favorites (
     path TEXT PRIMARY KEY
@@ -50,6 +51,11 @@ class SongDatabase:
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(artists)")}
         if "avatar_tried_at" not in cols:
             self._conn.execute("ALTER TABLE artists ADD COLUMN avatar_tried_at REAL")
+        # Migrate pre-0.3 databases that lack the normalization flag.
+        if "normalized" not in cols:
+            self._conn.execute(
+                "ALTER TABLE artists ADD COLUMN normalized INTEGER NOT NULL DEFAULT 0"
+            )
         song_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(songs)")}
         if "size" not in song_cols:
             self._conn.execute("ALTER TABLE songs ADD COLUMN size INTEGER")
@@ -203,11 +209,15 @@ class SongDatabase:
         return bytes(row[0])
 
     def set_avatar(self, name: str, data: bytes) -> None:
+        # Callers hand over data that already went through
+        # normalize_avatar (see fetch_artist_avatar), so it can be
+        # flagged normalized: future render passes skip re-decoding it.
         self._conn.execute(
-            "INSERT INTO artists (name, avatar, avatar_tried, avatar_tried_at) "
-            "VALUES (?, ?, 1, ?) "
+            "INSERT INTO artists (name, avatar, avatar_tried, avatar_tried_at, normalized) "
+            "VALUES (?, ?, 1, ?, 1) "
             "ON CONFLICT(name) DO UPDATE SET avatar = excluded.avatar, "
-            "avatar_tried = 1, avatar_tried_at = excluded.avatar_tried_at",
+            "avatar_tried = 1, avatar_tried_at = excluded.avatar_tried_at, "
+            "normalized = 1",
             (name, data, time.time()),
         )
         self._conn.commit()

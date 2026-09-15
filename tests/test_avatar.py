@@ -510,13 +510,21 @@ def test_normalize_avatar_garbage_returns_none():
 
 # --- AvatarRenderer (background decode + one-time migration) ------------
 def test_renderer_migrates_large_avatar(qapp, tmp_path):
+    import sqlite3
+
     from ezkaraoke.database import SongDatabase
 
     db = SongDatabase(tmp_path / "songs.db")
     small = _jpeg(100, 100)
     big = _jpeg(500, 500, noisy=True)
     db.set_avatar("小歌手", small)
-    db.set_avatar("大歌手", big)
+    # Legacy row as stored by pre-normalization versions: a raw large
+    # avatar with normalized = 0. (set_avatar now flags its data as
+    # already normalized, mirroring the fetch path.)
+    raw = sqlite3.connect(db.path)
+    raw.execute("INSERT INTO artists (name, avatar) VALUES (?, ?)", ("大歌手", big))
+    raw.commit()
+    raw.close()
     emitted: list[tuple[str, bytes]] = []
     done = []
     renderer = avatar_mod.AvatarRenderer(["小歌手", "大歌手"], db.path)
@@ -538,4 +546,35 @@ def test_renderer_migrates_large_avatar(qapp, tmp_path):
     assert db.get_avatar("大歌手") == by_name["大歌手"]
     assert db.get_avatar("小歌手") == small
     assert done == [True]
+    db.close()
+
+
+def test_renderer_skips_decoding_already_normalized(qapp, tmp_path, monkeypatch):
+    """Steady-state startup: normalized rows pass through without decoding."""
+    from ezkaraoke.database import SongDatabase
+
+    db = SongDatabase(tmp_path / "songs.db")
+    small = _jpeg(100, 100)
+    db.set_avatar("歌手", small)  # fetch path stores data already normalized
+    calls = []
+    orig = avatar_mod.normalize_avatar
+
+    def spy(data):
+        calls.append(data)
+        return orig(data)
+
+    monkeypatch.setattr(avatar_mod, "normalize_avatar", spy)
+    emitted: list[tuple[str, bytes]] = []
+    renderer = avatar_mod.AvatarRenderer(["歌手"], db.path)
+    renderer.rendered.connect(lambda batch: emitted.extend(batch))
+    renderer.start()
+    deadline = time.time() + 15
+    while renderer.isRunning() and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert renderer.wait(5000)
+    for _ in range(100):
+        qapp.processEvents()
+    assert calls == []  # flagged row: decode skipped entirely
+    assert dict(emitted)["歌手"] == small
     db.close()

@@ -843,3 +843,412 @@ def test_qr_row_unavailable_on_port_conflict(qapp, win, monkeypatch):
     qapp.processEvents()
     assert win._qr_label.pixmap().isNull()
     assert "8848" in win._qr_url.text()
+
+
+# ------------------------------------------------------------- mic mixer
+
+def test_mixer_button_opens_dialog(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    assert win._btn_mixer.text() == "混音台"
+    assert win._btn_mixer.objectName() == "ToolButton"
+    assert not win._btn_mixer.isCheckable()
+    assert win._mixer_dialog is None
+
+    win._btn_mixer.click()
+    qapp.processEvents()
+    assert win._mixer_dialog is not None
+    assert win._mixer_dialog.isVisible()
+    assert win._mixer_dialog.windowTitle() == "混音台"
+
+    first = win._mixer_dialog
+    win._btn_mixer.click()  # second click: raises the same dialog
+    qapp.processEvents()
+    assert win._mixer_dialog is first
+
+    win._mixer_dialog.close()
+    qapp.processEvents()
+    assert win._mixer_dialog is None
+
+
+def test_mixer_enable_persists(qapp, win, monkeypatch):
+    saved: list = []
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: saved.append(cfg)
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        win._controller, "set_mic_enabled", lambda on: calls.append(on)
+    )
+    config = win._config
+    win._btn_mixer.click()
+    qapp.processEvents()
+    # The enable state is initialised from the config (default: enabled).
+    assert win._mic_enable_btn.isChecked() is True
+
+    win._mic_enable_btn.click()
+    qapp.processEvents()
+    assert calls == [False]
+    assert config.mic_enabled is False
+    assert saved and saved[-1] is config
+
+
+def test_mixer_volume_slider(qapp, win, monkeypatch):
+    saved: list = []
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: saved.append(cfg)
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        win._controller, "configure_mic", lambda **kwargs: calls.append(kwargs)
+    )
+    config = win._config
+    win._btn_mixer.click()
+    qapp.processEvents()
+    slider = win._mic_gain_slider
+    assert slider.minimum() == -24
+    assert slider.maximum() == 24
+    assert slider.value() == 0
+    assert win._mic_gain_value.text() == "+0 dB"
+
+    slider.setValue(10)
+    qapp.processEvents()
+    assert calls and calls[-1]["gain_db"] == 10.0
+    assert calls[-1]["enabled"] is True
+    assert win._mic_gain_value.text() == "+10 dB"
+    # The in-memory config updates immediately; the write is debounced
+    # by the single-shot timer, so nothing is persisted yet.
+    assert config.mic_gain_db == 10.0
+    assert saved == []
+    win._save_mic_config()
+    assert saved and saved[-1] is config
+
+
+def test_mixer_device_combo(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices",
+        lambda: [(4, "USB Mic"), (7, "Webcam")],
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        win._controller, "configure_mic", lambda **kwargs: calls.append(kwargs)
+    )
+    config = win._config
+    win._btn_mixer.click()
+    qapp.processEvents()
+    combo = win._mic_device_combo
+    # 系统默认 + both devices; item DATA is the device name, never
+    # the index.
+    assert combo.count() == 3
+    assert combo.itemText(0) == "系统默认"
+    assert combo.itemData(0) == ""
+    assert combo.itemText(1) == "USB Mic"
+    assert combo.itemData(1) == "USB Mic"
+    assert combo.itemText(2) == "Webcam"
+    assert combo.itemData(2) == "Webcam"
+
+    # Selecting an item passes the device NAME to configure_mic.
+    combo.setCurrentIndex(1)
+    qapp.processEvents()
+    assert calls and calls[-1]["device"] == "USB Mic"
+    assert config.mic_device == "USB Mic"
+
+
+def test_mixer_status_semantics(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    controller = win._controller
+    win._btn_mixer.click()
+    qapp.processEvents()
+    # Stop the 500 ms status poller so it cannot race the assertions.
+    win._mic_status_timer.stop()
+
+    class FakeMixer:
+        def __init__(self, running: bool, last_error: str | None):
+            self._running = running
+            self.last_error = last_error
+
+        def is_running(self) -> bool:
+            return self._running
+
+    # No mixer at all.
+    controller._mic_mixer = None
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风不可用"
+
+    # Enabled and playing, but the stream never started: show the
+    # failure reason instead of the misleading "未启用".
+    controller._mic_mixer = FakeMixer(False, "boom")
+    controller._state = "playing"
+    win._mic_enable_btn.setChecked(True)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "boom"
+
+    # Stopped: "not running" is the normal condition again.
+    controller._state = "stopped"
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：未启用"
+
+    # Playing but the user turned the mic off: plain "未启用".
+    controller._state = "playing"
+    win._mic_enable_btn.setChecked(False)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：未启用"
+
+    # Stream running: "已启用" regardless of a latched error.
+    controller._mic_mixer = FakeMixer(True, "boom")
+    win._mic_enable_btn.setChecked(True)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：已启用"
+
+
+def test_mixer_stored_device_absent(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: [(4, "USB Mic")]
+    )
+    config = win._config
+    config.mic_device = "Ghost Mic"
+    win._btn_mixer.click()
+    qapp.processEvents()
+    combo = win._mic_device_combo
+    # The stored device is no longer enumerated (unplugged or renamed):
+    # it must remain visible and selectable, not silently reset to
+    # 系统默认.
+    idx = combo.findData("Ghost Mic")
+    assert idx >= 0
+    assert combo.itemText(idx) == "Ghost Mic"
+    assert combo.currentIndex() == idx
+    assert config.mic_device == "Ghost Mic"
+
+
+# ------------------------------------------------- mic mixer (混音台)
+
+def test_select_window_mixer_button_opens_dialog(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    # Plain (non-checkable) toolbar button, like the loudness one.
+    assert win._btn_mixer.text() == "混音台"
+    assert win._btn_mixer.objectName() == "ToolButton"
+    assert not win._btn_mixer.isCheckable()
+    assert win._mixer_dialog is None
+
+    win._btn_mixer.click()
+    qapp.processEvents()
+    assert win._mixer_dialog is not None
+    assert win._mixer_dialog.isVisible()
+    assert win._mixer_dialog.windowTitle() == "混音台"
+
+    # A second click raises the existing dialog instead of stacking another.
+    first = win._mixer_dialog
+    win._btn_mixer.click()
+    qapp.processEvents()
+    assert win._mixer_dialog is first
+
+    first.close()
+    qapp.processEvents()
+    assert win._mixer_dialog is None
+
+
+def test_select_window_mixer_enable_persists(qapp, win, monkeypatch):
+    saved: list = []
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: saved.append(cfg)
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    calls: list = []
+    monkeypatch.setattr(
+        win._controller, "set_mic_enabled", lambda on: calls.append(on)
+    )
+    # SelectWindow.__init__ already ran the real configure_mic; drop the
+    # mixer so the status line reads "unavailable" like the pre-mixer state.
+    win._controller._mic_mixer = None
+    # The dialog initialises from the config on the window.
+    win._config.mic_enabled = False
+
+    win._btn_mixer.click()
+    qapp.processEvents()
+    assert win._mic_enable_btn.isChecked() is False
+    assert win._mic_status_label.text() == "麦克风不可用"
+
+    win._mic_enable_btn.click()
+    qapp.processEvents()
+    assert calls == [True]
+    assert win._config.mic_enabled is True
+    assert saved and saved[-1] is win._config
+
+    win._mixer_dialog.close()
+    qapp.processEvents()
+
+
+def test_select_window_mixer_volume_slider(qapp, win, monkeypatch):
+    saved: list = []
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: saved.append(cfg)
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    calls: list = []
+
+    def fake_configure(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(win._controller, "configure_mic", fake_configure)
+    win._btn_mixer.click()
+    qapp.processEvents()
+    slider = win._mic_gain_slider
+    assert slider.minimum() == -24
+    assert slider.maximum() == 24
+    assert slider.value() == 0
+    assert win._mic_gain_value.text() == "+0 dB"
+
+    slider.setValue(10)
+    qapp.processEvents()
+    assert calls and calls[-1]["gain_db"] == 10.0
+    assert calls[-1]["enabled"] is True
+    assert win._mic_gain_value.text() == "+10 dB"
+    # The in-memory config updates immediately; the write is debounced
+    # by the single-shot timer, so nothing is on disk yet.
+    assert win._config.mic_gain_db == 10.0
+    assert saved == []
+    win._save_mic_config()
+    assert saved and saved[-1] is win._config
+
+    win._mixer_dialog.close()
+    qapp.processEvents()
+
+
+def test_select_window_mixer_device_combo(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices",
+        lambda: [(4, "USB Mic"), (7, "Webcam")],
+    )
+    calls: list = []
+
+    def fake_configure(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(win._controller, "configure_mic", fake_configure)
+    win._btn_mixer.click()
+    qapp.processEvents()
+    combo = win._mic_device_combo
+    # 系统默认 + both devices; item DATA is the device name, never
+    # the index.
+    assert combo.count() == 3
+    assert combo.itemText(0) == "系统默认"
+    assert combo.itemData(0) == ""
+    assert combo.itemText(1) == "USB Mic"
+    assert combo.itemData(1) == "USB Mic"
+    assert combo.itemText(2) == "Webcam"
+    assert combo.itemData(2) == "Webcam"
+
+    # Selecting an item passes the device NAME to configure_mic.
+    combo.setCurrentIndex(1)
+    qapp.processEvents()
+    assert calls and calls[-1]["device"] == "USB Mic"
+    assert win._config.mic_device == "USB Mic"
+
+    win._mixer_dialog.close()
+    qapp.processEvents()
+
+
+def test_select_window_mixer_status_semantics(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: []
+    )
+    win._btn_mixer.click()
+    qapp.processEvents()
+    # Stop the 500 ms status poller so it cannot race the assertions.
+    win._mic_status_timer.stop()
+    controller = win._controller
+
+    class FakeMixer:
+        def __init__(self, running: bool, last_error: str | None):
+            self._running = running
+            self.last_error = last_error
+
+        def is_running(self) -> bool:
+            return self._running
+
+    # No mixer at all.
+    controller._mic_mixer = None
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风不可用"
+
+    # Enabled and playing, but the stream never started: show the
+    # failure reason instead of the misleading "未启用".
+    controller._mic_mixer = FakeMixer(False, "boom")
+    controller._state = "playing"
+    win._mic_enable_btn.setChecked(True)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "boom"
+
+    # Stopped: "not running" is the normal condition again.
+    controller._state = "stopped"
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：未启用"
+
+    # Playing but the user turned the mic off: plain "未启用".
+    controller._state = "playing"
+    win._mic_enable_btn.setChecked(False)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：未启用"
+
+    # Stream running: "已启用" regardless of a latched error.
+    controller._mic_mixer = FakeMixer(True, "boom")
+    win._mic_enable_btn.setChecked(True)
+    win._update_mic_status()
+    assert win._mic_status_label.text() == "麦克风：已启用"
+
+    win._mixer_dialog.close()
+    qapp.processEvents()
+
+
+def test_select_window_mixer_stored_device_absent(qapp, win, monkeypatch):
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.save_config", lambda cfg: None
+    )
+    monkeypatch.setattr(
+        "ezkaraoke.select_window.list_input_devices", lambda: [(4, "USB Mic")]
+    )
+    win._config.mic_device = "Ghost Mic"
+    win._btn_mixer.click()
+    qapp.processEvents()
+    combo = win._mic_device_combo
+    # The stored device is no longer enumerated (unplugged or renamed):
+    # it must remain visible and selectable, not silently reset to
+    # 系统默认.
+    idx = combo.findData("Ghost Mic")
+    assert idx >= 0
+    assert combo.itemText(idx) == "Ghost Mic"
+    assert combo.currentIndex() == idx
+    assert win._config.mic_device == "Ghost Mic"
+
+    win._mixer_dialog.close()
+    qapp.processEvents()

@@ -92,6 +92,7 @@ def _state_payload(controller: PlayerController, db: SongDatabase) -> dict:
             "multi": controller.has_multi_audio_track(),
             "index": controller.audio_track_index,
         },
+        "mic": controller.mic_settings(),
     }
 
 
@@ -100,6 +101,22 @@ def _as_index(payload: dict) -> int:
         return int(payload.get("index", -1))
     except (TypeError, ValueError):
         return -1
+
+
+def _as_bool(value) -> bool | None:
+    """True/False for JSON booleans; None for anything else (caller keeps
+    the previous value)."""
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _as_float_clamped(value, lo: float, hi: float) -> float | None:
+    """Clamped float for JSON numbers (booleans excluded); None for
+    anything else (caller keeps the previous value)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return min(hi, max(lo, float(value)))
 
 
 class WebServer(QObject):
@@ -252,6 +269,32 @@ class WebServer(QObject):
                 return {"error": "unknown track action"}
             self._controller.toggle_audio_track()
             return _state_payload(self._controller, self._db)
+        if action == "mic":
+            # Merge the payload onto the current settings; unknown keys and
+            # invalid values are ignored, numbers are clamped to the ranges
+            # the mic mixer accepts.
+            cur = self._controller.mic_settings()
+            enabled = _as_bool(payload.get("enabled"))
+            gain_db = _as_float_clamped(payload.get("gain_db"), -24.0, 24.0)
+            echo = _as_float_clamped(payload.get("echo"), 0.0, 1.0)
+            bass_db = _as_float_clamped(payload.get("bass_db"), -12.0, 12.0)
+            treble_db = _as_float_clamped(payload.get("treble_db"), -12.0, 12.0)
+            device = payload.get("device")
+            self._controller.configure_mic(
+                enabled=enabled if enabled is not None else cur["enabled"],
+                gain_db=gain_db if gain_db is not None else cur["gain_db"],
+                echo=echo if echo is not None else cur["echo"],
+                bass_db=bass_db if bass_db is not None else cur["bass_db"],
+                treble_db=treble_db if treble_db is not None else cur["treble_db"],
+                device=device if isinstance(device, str) else cur["device"],
+            )
+            return _state_payload(self._controller, self._db)
+        if action == "mic_devices":
+            return {
+                "devices": [
+                    name for _index, name in self._controller.list_mic_devices()
+                ]
+            }
         return {"error": "unknown action"}
 
 
@@ -360,6 +403,15 @@ button { min-height:44px; }
 .op.fav { min-width:44px; height:44px; color:var(--dim); font-size:18px; }
 .op.fav.on { color:var(--danger); }
 .empty { color:var(--dim); font-size:14px; text-align:center; padding:12px 0; }
+.microw { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+#mic-status { flex:1; min-width:0; font-size:14px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+#mic-status.err { color:var(--danger); }
+.micctl { margin-top:12px; }
+.micctl label { display:flex; justify-content:space-between; font-size:13px; color:var(--dim); margin-bottom:4px; }
+.micctl label span { color:var(--fg); }
+.micctl input[type=range] { width:100%; margin:0; padding:6px 0; background:transparent; }
+.micctl select { width:100%; padding:10px; font-size:14px; border-radius:8px; border:1px solid #2a2a3e; background:#151520; color:var(--fg); outline:none; }
+.micwarn { margin-top:12px; font-size:12px; color:var(--dim); }
 nav { position:fixed; bottom:0; left:0; right:0; background:#151520; border-top:1px solid #2a2a3e; display:flex; justify-content:space-around; padding:8px 8px calc(8px + env(safe-area-inset-bottom)); z-index:3; }
 nav button { flex:1; margin:0 4px; background:#2a2a3e; color:var(--fg); border:none; border-radius:10px; padding:10px 0; font-size:14px; }
 nav button.primary { background:var(--accent); color:#0c0c14; font-weight:700; }
@@ -383,6 +435,34 @@ nav button.warn { color:var(--danger); }
     <h2>播放队列</h2>
     <ul id="queue"></ul>
     <div id="qempty" class="empty">队列为空，搜索后点「＋ 点歌」加入</div>
+  </section>
+  <section>
+    <h2>调音台</h2>
+    <div class="microw">
+      <span id="mic-status">麦克风：未启用</span>
+      <button id="b-mic-toggle" class="op track">启用麦克风</button>
+    </div>
+    <div class="micctl">
+      <label for="mic-gain">音量 <span id="mic-gain-val">+0 dB</span></label>
+      <input id="mic-gain" type="range" min="-24" max="24" step="1" value="0">
+    </div>
+    <div class="micctl">
+      <label for="mic-echo">回声 <span id="mic-echo-val">0%</span></label>
+      <input id="mic-echo" type="range" min="0" max="100" step="1" value="0">
+    </div>
+    <div class="micctl">
+      <label for="mic-bass">低音 <span id="mic-bass-val">+0 dB</span></label>
+      <input id="mic-bass" type="range" min="-12" max="12" step="1" value="0">
+    </div>
+    <div class="micctl">
+      <label for="mic-treble">高音 <span id="mic-treble-val">+0 dB</span></label>
+      <input id="mic-treble" type="range" min="-12" max="12" step="1" value="0">
+    </div>
+    <div class="micctl">
+      <label for="mic-device">输入设备</label>
+      <select id="mic-device"><option value="">系统默认</option></select>
+    </div>
+    <div class="micwarn">建议佩戴耳机，避免啸叫</div>
   </section>
 </main>
 <nav>
@@ -450,7 +530,78 @@ function render(state) {
     ul.appendChild(li);
   }
   $("qempty").style.display = n ? "none" : "block";
+  renderMic(state.mic);
 }
+
+// ------------------------------------------------------------- 调音台 (mic)
+const fmtDb = v => { const x = Number(v); return (x >= 0 ? "+" : "") + (Number.isInteger(x) ? x : x.toFixed(1)) + " dB"; };
+const fmtPct = v => Math.round(v) + "%";
+
+let lastMic = null;      // last state.mic (used by the enable/disable toggle)
+let micDevicesLoaded = false;
+
+function renderMic(mic) {
+  lastMic = mic || null;
+  if (!mic) return;
+  const st = $("mic-status");
+  if (mic.error) {
+    st.innerHTML = "麦克风不可用：" + esc(mic.error);
+    st.classList.add("err");
+  } else {
+    st.classList.remove("err");
+    st.textContent = mic.enabled ? "麦克风：已启用" : "麦克风：未启用";
+  }
+  $("b-mic-toggle").textContent = mic.enabled ? "停用麦克风" : "启用麦克风";
+  // Don't fight the user while they drag: only push a value into a slider
+  // that is not focused; the live label always follows the state.
+  const setSlider = (id, valId, value, fmt) => {
+    const el = $(id), lab = $(valId);
+    if (document.activeElement !== el) el.value = String(value);
+    lab.textContent = fmt(value);
+  };
+  setSlider("mic-gain", "mic-gain-val", mic.gain_db || 0, fmtDb);
+  setSlider("mic-echo", "mic-echo-val", Math.round((mic.echo || 0) * 100), fmtPct);
+  setSlider("mic-bass", "mic-bass-val", mic.bass_db || 0, fmtDb);
+  setSlider("mic-treble", "mic-treble-val", mic.treble_db || 0, fmtDb);
+  const sel = $("mic-device");
+  if (document.activeElement !== sel) sel.value = mic.device || "";
+}
+
+$("b-mic-toggle").onclick = async () => {
+  await post({action:"mic", enabled: !(lastMic && lastMic.enabled)});
+  refresh();
+};
+const wireMicSlider = (id, valId, key, toServer, fmt) => {
+  const el = $(id), lab = $(valId);
+  el.addEventListener("input", () => { lab.textContent = fmt(Number(el.value)); });
+  el.addEventListener("change", async () => {
+    await post({action:"mic", [key]: toServer(Number(el.value))});
+    refresh();
+  });
+};
+wireMicSlider("mic-gain", "mic-gain-val", "gain_db", v => v, fmtDb);
+wireMicSlider("mic-echo", "mic-echo-val", "echo", v => v / 100, fmtPct);
+wireMicSlider("mic-bass", "mic-bass-val", "bass_db", v => v, fmtDb);
+wireMicSlider("mic-treble", "mic-treble-val", "treble_db", v => v, fmtDb);
+$("mic-device").addEventListener("change", async () => {
+  await post({action:"mic", device: $("mic-device").value});
+  refresh();
+});
+
+// Device list: fetched once on load via the mic_devices action.
+(async () => {
+  if (micDevicesLoaded) return;
+  micDevicesLoaded = true;
+  const d = await post({action:"mic_devices"});
+  const sel = $("mic-device");
+  for (const name of d.devices || []) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.innerHTML = esc(name);
+    sel.appendChild(opt);
+  }
+  if (lastMic) sel.value = lastMic.device || "";
+})();
 
 async function refresh() {
   const s = await api("/api/state");

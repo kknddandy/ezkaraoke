@@ -1680,6 +1680,7 @@ def test_configure_mic_while_playing_starts_stream(qapp):
     p.append(make("A", "a1"))
     fake = _FakeMicMixer()
     p.attach_mic_mixer(fake)
+    p.set_mic_enabled(False)  # the mic is on by default; switch it off first
     p.play_at(0)  # mic disabled: nothing starts yet
     assert p.is_playing
     assert fake.started == 0
@@ -1700,6 +1701,70 @@ def test_configure_mic_while_playing_starts_stream(qapp):
         "treble_db": 0.0,
     }
     p.stop()
+
+
+def test_mic_settings_defaults(qapp):
+    p = PlayerController()
+    assert p.mic_settings() == {
+        "enabled": True,  # default on (matches Config.mic_enabled)
+        "gain_db": 0.0,
+        "echo": 0.0,
+        "bass_db": 0.0,
+        "treble_db": 0.0,
+        "device": "",
+        "running": False,
+        "error": None,
+    }
+
+
+def test_mic_settings_reflects_configured_values(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    # configure_mic rebuilds the mixer when the device changes; mark the
+    # injected fake as already built for this device so it is reused.
+    p._mic_device = "USB 麦克风"
+    p.configure_mic(
+        enabled=True,
+        gain_db=6.0,
+        echo=0.5,
+        bass_db=3.0,
+        treble_db=-2.0,
+        device="USB 麦克风",
+    )
+    assert p.mic_mixer is fake
+    p.play_at(0)  # the stream opens: live status must report it
+    s = p.mic_settings()
+    assert s["enabled"] is True
+    assert s["gain_db"] == 6.0
+    assert s["echo"] == 0.5
+    assert s["bass_db"] == 3.0
+    assert s["treble_db"] == -2.0
+    assert s["device"] == "USB 麦克风"
+    assert s["running"] is True
+    assert s["error"] is None
+    p.stop()
+
+
+def test_mic_settings_reports_mixer_error(qapp):
+    class _BrokenMic(_FakeMicMixer):
+        last_error = "RuntimeError: DSP boom"
+
+    p = PlayerController()
+    p.attach_mic_mixer(_BrokenMic())
+    s = p.mic_settings()  # never raises, even with a latched mixer error
+    assert s["running"] is False
+    assert s["error"] == "RuntimeError: DSP boom"
+
+
+def test_list_mic_devices_returns_list(qapp):
+    p = PlayerController()
+    devices = p.list_mic_devices()  # headless / no device: never raises
+    assert isinstance(devices, list)
+    assert all(
+        isinstance(item, tuple) and len(item) == 2 for item in devices
+    )
 
 
 def test_real_mixer_noop_under_dummy_audio(qapp, monkeypatch):

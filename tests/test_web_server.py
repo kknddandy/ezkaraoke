@@ -142,8 +142,32 @@ def test_state_empty(server, qapp):
         "current": None,
         "queue": [],
         "track": {"multi": False, "index": 0},
+        "mic": {
+            "enabled": True,
+            "gain_db": 0.0,
+            "echo": 0.0,
+            "bass_db": 0.0,
+            "treble_db": 0.0,
+            "device": "",
+            "running": False,
+            "error": None,
+        },
     }
     assert body["track"]["multi"] is False
+
+
+def test_state_mic_block_defaults(server, qapp):
+    status, body = get_json(qapp, base_of(server), "/api/state")
+    assert status == 200
+    mic = body["mic"]
+    assert mic["enabled"] is True  # the mic is on by default
+    assert mic["running"] is False
+    assert mic["error"] is None
+    assert mic["gain_db"] == 0.0
+    assert mic["echo"] == 0.0
+    assert mic["bass_db"] == 0.0
+    assert mic["treble_db"] == 0.0
+    assert mic["device"] == ""
 
 
 def test_search_by_artist(server, qapp):
@@ -418,6 +442,60 @@ def test_track_toggle_with_stub_player(server, qapp):
         assert fake.set_calls == [2, 1]
     finally:
         server._controller._player = None
+
+
+# ----------------------------------------------------------------------- mic
+def test_mic_action_sets_settings_and_returns_state(server, qapp):
+    base = base_of(server)
+    status, body = post_action(qapp, base, "mic", enabled=False, gain_db=6)
+    assert status == 200
+    mic = body["mic"]
+    assert mic["enabled"] is False
+    assert mic["gain_db"] == 6.0
+    # the other keys are merged from the current (default) settings
+    assert mic["echo"] == 0.0
+    assert mic["bass_db"] == 0.0
+    assert mic["treble_db"] == 0.0
+    assert mic["device"] == ""
+    # and the next /api/state reflects the same values
+    status, st = get_json(qapp, base, "/api/state")
+    assert status == 200
+    assert st["mic"]["enabled"] is False
+    assert st["mic"]["gain_db"] == 6.0
+
+
+def test_mic_action_clamps_out_of_range(server, qapp):
+    base = base_of(server)
+    status, body = post_action(qapp, base, "mic", gain_db=999, echo=5)
+    assert status == 200
+    assert body["mic"]["gain_db"] == 24.0
+    assert body["mic"]["echo"] == 1.0
+
+
+def test_mic_action_ignores_invalid_types(server, qapp):
+    base = base_of(server)
+    status, body = post_action(
+        qapp, base, "mic", enabled="yes", gain_db="loud", echo=None, device=123
+    )
+    assert status == 200
+    mic = body["mic"]
+    # every invalid value is ignored: the current (default) settings remain
+    assert mic["enabled"] is True
+    assert mic["gain_db"] == 0.0
+    assert mic["echo"] == 0.0
+    assert mic["device"] == ""
+
+
+def test_mic_devices_returns_names(server, qapp, monkeypatch):
+    import ezkaraoke.mic_mixer as mic_mixer
+
+    monkeypatch.setattr(
+        mic_mixer, "list_input_devices",
+        lambda: [(0, "USB 麦克风"), (1, "内置麦克风")],
+    )
+    status, body = post_action(qapp, base_of(server), "mic_devices")
+    assert status == 200
+    assert body == {"devices": ["USB 麦克风", "内置麦克风"]}
 
 
 # -------------------------------------------------------------------- errors

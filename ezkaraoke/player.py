@@ -149,7 +149,16 @@ class PlayerController(QObject):
         # lives across songs and is driven by _sync_mic on state changes.
         self._mic_mixer = None
         self._mic_device = None  # input device the current mixer was built for
-        self._mic_enabled = False
+        self._mic_enabled = True  # default on (matches Config.mic_enabled)
+        # Last applied mic parameters (read back via mic_settings); kept in
+        # sync by configure_mic.
+        self._mic_params = {
+            "gain_db": 0.0,
+            "echo": 0.0,
+            "bass_db": 0.0,
+            "treble_db": 0.0,
+            "device": "",
+        }
 
     # ------------------------------------------------------------------ state
     @property
@@ -940,9 +949,47 @@ class PlayerController(QObject):
             m.set_bass_db(bass_db)
             m.set_treble_db(treble_db)
             self._mic_enabled = bool(enabled)
+            # Record what was applied so the settings can be read back.
+            self._mic_params = {
+                "gain_db": float(gain_db),
+                "echo": float(echo),
+                "bass_db": float(bass_db),
+                "treble_db": float(treble_db),
+                "device": device or "",
+            }
             self._sync_mic()
         except Exception:  # noqa: BLE001 - mic problems must never crash startup
             pass
+
+    def mic_settings(self) -> dict:
+        """Current mic settings + live status (safe without libvlc/sounddevice)."""
+        mixer = self._mic_mixer
+        running = False
+        error = None
+        if mixer is not None:
+            try:
+                running = bool(mixer.is_running())
+            except Exception:  # noqa: BLE001 - never raise from a status query
+                pass
+            try:
+                error = getattr(mixer, "last_error", None)
+            except Exception:  # noqa: BLE001
+                error = None
+        return {
+            "enabled": bool(self._mic_enabled),
+            **self._mic_params,
+            "running": running,
+            "error": error,
+        }
+
+    def list_mic_devices(self) -> list[tuple[int, str]]:
+        """(index, name) microphone inputs; [] when unavailable."""
+        try:
+            from ezkaraoke.mic_mixer import list_input_devices
+
+            return list(list_input_devices())
+        except Exception:  # noqa: BLE001
+            return []
 
     def set_mic_enabled(self, enabled: bool) -> None:
         """Enable/disable mic mixing; syncs the stream with the state."""

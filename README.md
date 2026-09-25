@@ -212,9 +212,12 @@ Measurement averages ≈ 98× real time with `-vn`; the full 15,237-file /
 
 Sing along with your own voice: when a song starts playing,
 ezkaraoke opens the microphone and mixes it into the same output
-as the song. A mixer window (opened from the player window)
-controls mic on/off, volume, echo, bass, treble and the input
-device; it can be shown or hidden at any time.
+as the song. A mixer window (opened from the song-selection
+window's toolbar) controls mic on/off, volume, echo, bass,
+treble and the input device; it can be shown or hidden at any
+time. The phone-ordering web page (手机点歌) also has a mixer
+section (调音台) with the same controls, so the mic can be
+adjusted from a phone on the LAN.
 
 **Use headphones.** With speakers and high echo or gain the
 microphone can pick up its own output and cause acoustic
@@ -511,8 +514,11 @@ python -m ezkaraoke.loudness --stats        # 只打印统计，不测量
 ## 麦克风混音
 
 跟唱：歌曲开始播放时，ezkaraoke 打开麦克风，把你的声音混入与
-歌曲相同的输出。混音台窗口（从播放窗口打开）可控制麦克风开关、
-音量、混响（echo）、低音、高音与输入设备；可随时显示/隐藏。
+歌曲相同的输出。混音台窗口（从点歌界面的工具栏打开）可控制
+麦克风开关、音量、混响（echo）、低音、高音与输入设备；可随
+时显示/隐藏。手机点歌网页上也有调音台区域，包含同样的控制项
+（麦克风开关、音量、混响、低音、高音、输入设备），可以在
+局域网内用手机调整麦克风。
 
 **请戴耳机使用。** 使用外置音箱且混响/音量偏大时，麦克风可能拾取
 自身输出并产生声学反馈（啸叫）。为保证稳定，混响反馈系数设有

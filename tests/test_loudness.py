@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QApplication
 
 from ezkaraoke.database import SCHEMA, SongDatabase
 from ezkaraoke.loudness import (
+    LoudnessResult,
     LoudnessWorker,
     audio_track_count,
     build_cmd,
@@ -338,12 +339,55 @@ def test_pending_files_does_not_retry_deliberate_failures(tmp_path):
         )
         conn.commit()
         # 'a' keeps its matching snapshot -> only 'b' is pending
-        assert pending_files(conn) == [(str(b), 0, st_b.st_size, st_b.st_mtime)]
-        # force re-measures everything, ignoring snapshots
+        assert pending_files(conn) == [(str(b), st_b.st_size, st_b.st_mtime, set())]
+        # force re-measures everything, ignoring snapshots (matching is
+        # always empty when forcing)
         forced = [
-            (p, pos) for p, pos, _s, _m in pending_files(conn, force=True)
+            (p, matching)
+            for p, _s, _m, matching in pending_files(conn, force=True)
         ]
-        assert forced == [(str(a), 0), (str(b), 0)]
+        assert forced == [(str(a), set()), (str(b), set())]
+    finally:
+        conn.close()
+
+
+def test_pending_files_does_not_call_ffprobe(tmp_path, monkeypatch):
+    """Enumeration is stat+DB only: ffprobe must NOT be spawned here."""
+    folder = tmp_path / "media"
+    folder.mkdir()
+    stats = {}
+    for name in ("a.mp4", "b.mp4"):
+        p = folder / name
+        p.write_bytes(b"x" * 100)
+        stats[str(p)] = os.stat(str(p))
+
+    conn = sqlite3.connect(str(tmp_path / "t.db"))
+    try:
+        conn.executescript(SCHEMA)
+        for path, st in stats.items():
+            conn.execute(
+                "INSERT INTO songs (path, artist, title, letter, size) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (path, "X", "x", "X", st.st_size),
+            )
+        conn.commit()
+
+        calls = []
+
+        def fail_ffprobe(path):
+            calls.append(path)
+            raise AssertionError("pending_files must not call ffprobe")
+
+        monkeypatch.setattr(
+            "ezkaraoke.loudness.audio_track_count", fail_ffprobe
+        )
+        got = sorted(pending_files(conn))
+        expected = sorted(
+            (path, st.st_size, st.st_mtime, set())
+            for path, st in stats.items()
+        )
+        assert got == expected
+        assert calls == []
     finally:
         conn.close()
 
@@ -384,6 +428,59 @@ def test_worker_is_idempotent(qapp, tmp_path):
     db.close()
 
 
+def test_enumeration_total_known_before_measurement(qapp, tmp_path, monkeypatch):
+    """The first total-carrying progress emission must already have the
+    full candidate count, BEFORE any measurement completes.
+
+    On a large library the old code ffprobe'd every file serially during
+    enumeration, so the GUI sat on "0/0" for minutes; now enumeration is
+    stat+DB only and total is known almost immediately.
+    """
+    folder = tmp_path / "media"
+    folder.mkdir()
+    for name in ("A-a.mp4", "B-b.mp4", "C-c.mp4"):
+        (folder / name).write_bytes(b"x" * 100)
+    db, db_path = _db_with_folder(str(folder), tmp_path)
+
+    release = threading.Event()
+    completed = []
+
+    def stub_measure(path, track_pos, timeout=120.0, stop_event=None):
+        release.wait(5)
+        completed.append((path, track_pos))
+        return LoudnessResult(lufs=-11.0, peak_db=-3.0, duration=1.0)
+
+    monkeypatch.setattr("ezkaraoke.loudness.measure_file", stub_measure)
+    monkeypatch.setattr(
+        "ezkaraoke.loudness.audio_track_count", lambda path: 1
+    )
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/" + name)
+
+    worker = LoudnessWorker(db_path, workers=3)
+    progress = []
+    worker.progress.connect(lambda done, total: progress.append((done, total)))
+    worker.start()
+
+    # pump until a total-carrying emission lands...
+    deadline = time.time() + 10.0
+    while time.time() < deadline:
+        qapp.processEvents()
+        if any(d == 0 and t == 3 for d, t in progress):
+            break
+        time.sleep(0.005)
+
+    total_carrying = [(d, t) for d, t in progress if t]
+    assert total_carrying and total_carrying[0] == (0, 3)
+    # ...and no measurement had completed when it arrived
+    assert completed == []
+
+    release.set()
+    _wait_for_worker(qapp, worker)
+    assert len(completed) == 3
+    assert db.loudness_pending() == []
+    db.close()
+
+
 @requires_media_tools
 def test_mtime_change_requeues_file(qapp, tmp_path):
     """Spec 9.5: bumping the mtime invalidates the stored snapshot."""
@@ -411,7 +508,9 @@ def test_mtime_change_requeues_file(qapp, tmp_path):
     db.close()
     assert len(pending) == 1
     assert pending[0][0] == str(song)
-    assert pending[0][1] == 0  # single audio track
+    # the stored row's (size, mtime) snapshot no longer matches: nothing
+    # is reusable, the worker will re-measure from scratch
+    assert pending[0][3] == set()
 
 
 def test_worker_without_ffmpeg_emits_error(qapp, tmp_path, monkeypatch):
@@ -520,10 +619,12 @@ def test_stop_does_not_poison_inflight(qapp, tmp_path, monkeypatch):
     assert db.get_loudness(str(b)) == []
     conn = sqlite3.connect(db_path)
     try:
-        pending = {(p, pos) for p, pos, _s, _m in pending_files(conn)}
+        pending = pending_files(conn)
     finally:
         conn.close()
-    assert pending == {(str(a), 0), (str(b), 0)}
+    assert {p for p, _s, _m, _matching in pending} == {str(a), str(b)}
+    # nothing was measured: no stored row can match the current snapshot
+    assert all(matching == set() for _p, _s, _m, matching in pending)
     db.close()
 
 
@@ -559,7 +660,7 @@ def test_stop_mid_first_measure_leaves_no_rows(qapp, tmp_path, monkeypatch):
         pending = pending_files(conn)
     finally:
         conn.close()
-    assert [p for p, _pos, _s, _m in pending] == [str(song)]
+    assert [p for p, _s, _m, _matching in pending] == [str(song)]
     db.close()
 
 
@@ -628,8 +729,10 @@ def test_stop_keeps_other_track_rows(qapp, tmp_path, monkeypatch):
         pending = pending_files(conn)
     finally:
         conn.close()
-    assert {p for p, _pos, _s, _m in pending} == {str(song)}
-    assert sorted(pos for _p, pos, _s, _m in pending) == [0, 1]
+    assert {p for p, _s, _m, _matching in pending} == {str(song)}
+    # both pre-seeded rows carry the OLD snapshot: no position matches,
+    # so the worker will re-measure every track of the file
+    assert [matching for _p, _s, _m, matching in pending] == [set()]
     db.close()
 
 
@@ -657,8 +760,9 @@ def test_zero_audio_track_file_gets_final_failed_row(qapp, tmp_path):
         pending = pending_files(conn)
     finally:
         conn.close()
-    # one placeholder entry carrying a real size/mtime snapshot
-    assert pending == [(str(video), 0, st.st_size, st.st_mtime)]
+    # one candidate carrying a real size/mtime snapshot; the track count
+    # (0) is only discovered inside the pool by _measure_path
+    assert pending == [(str(video), st.st_size, st.st_mtime, set())]
 
     worker = LoudnessWorker(db_path, workers=1)
     worker.start()

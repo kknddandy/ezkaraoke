@@ -24,7 +24,7 @@ def main() -> int:
     db = SongDatabase(Path(config.db_path) if config.db_path else DEFAULT_DB_PATH)
     controller = PlayerController()
 
-    player_win = PlayerWindow(controller)
+    player_win = PlayerWindow(controller, config=config)
     select_win = SelectWindow(controller, db, config)
 
     player_win.show()

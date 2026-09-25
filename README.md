@@ -208,6 +208,52 @@ cpu/2; default 8).
 Measurement averages ≈ 98× real time with `-vn`; the full 15,237-file /
 1.1 TB library takes ≈ 1.7 h with 8 parallel workers (warm NAS cache).
 
+## Microphone mixing
+
+Sing along with your own voice: when a song starts playing,
+ezkaraoke opens the microphone and mixes it into the same output
+as the song. A mixer window (opened from the player window)
+controls mic on/off, volume, echo, bass, treble and the input
+device; it can be shown or hidden at any time.
+
+**Use headphones.** With speakers and high echo or gain the
+microphone can pick up its own output and cause acoustic
+feedback (howling). The echo feedback coefficient is capped
+below the stability limit, so the effect stays controllable.
+
+How it works — deliberately no virtual audio device:
+
+- A single PortAudio duplex stream captures the microphone; each
+  audio block runs a high-pass filter (80 Hz, rumble and
+  feedback safety) → gain → bass / treble shelf EQ (150 Hz /
+  6 kHz) → feedback-comb echo (~130 ms delay, feedback capped at
+  0.6 for stability), and the result is played back into the
+  system default output sink.
+- The OS audio server (PipeWire / PulseAudio) sums the mic
+  stream with VLC's output in the sound card. The song's audio
+  path and A/V sync are untouched: the mic stream opens on
+  play, mutes on pause and closes when playback stops (it stays
+  open between songs).
+
+Install / enable — the audio dependencies are an optional extra:
+
+```bash
+pip install ezkaraoke[mic]      # adds sounddevice, numpy, scipy
+sudo apt install libportaudio2  # Linux: system PortAudio runtime
+```
+
+Without them the feature is a silent no-op: the app plays
+normally and the mixer reports the mic as unavailable.
+
+Config: `mic_enabled` (default on), `mic_gain_db` (−24 to 24,
+default 0), `mic_echo` (0 to 1, default 0.35), `mic_bass_db` /
+`mic_treble_db` (−12 to 12, default 0), `mic_device` (input
+device name; empty = system default).
+
+Platform: Linux (PipeWire / PulseAudio) is supported and
+tested; Windows is not yet supported (WASAPI/MMDevice needs
+separate work).
+
 ## Project layout
 
 ```
@@ -461,6 +507,44 @@ python -m ezkaraoke.loudness --stats        # 只打印统计，不测量
 
 `-vn` 下测量速度平均约 98× 实时；15,237 个文件 / 1.1 TB 的曲库
 8 并行约 1.7 小时（NAS 热缓存）。
+
+## 麦克风混音
+
+跟唱：歌曲开始播放时，ezkaraoke 打开麦克风，把你的声音混入与
+歌曲相同的输出。混音台窗口（从播放窗口打开）可控制麦克风开关、
+音量、混响（echo）、低音、高音与输入设备；可随时显示/隐藏。
+
+**请戴耳机使用。** 使用外置音箱且混响/音量偏大时，麦克风可能拾取
+自身输出并产生声学反馈（啸叫）。为保证稳定，混响反馈系数设有
+上限，效果始终可控。
+
+工作原理——刻意不使用虚拟声卡/虚拟设备：
+
+- 单条 PortAudio 双工流采集麦克风：每个音频块依次经过高通滤波
+  （80 Hz，去低频与反馈隐患）→ 增益 → 低/高音搁架 EQ（150 Hz /
+  6 kHz）→ 反馈梳状混响（延迟约 130 ms，反馈上限 0.6 以保证
+  稳定），结果回放到系统默认输出设备。
+- 系统音频服务（PipeWire / PulseAudio）在声卡端把麦克风流与
+  VLC 的输出相加。歌曲的音频路径与音画同步完全不受影响：麦克风
+  流随播放打开、暂停时静音、停止时关闭（跨歌曲保持打开）。
+
+安装/启用——音频依赖为可选附加组件：
+
+```bash
+pip install ezkaraoke[mic]      # 增加 sounddevice、numpy、scipy
+sudo apt install libportaudio2  # Linux：系统 PortAudio 运行库
+```
+
+未安装时该功能静默禁用（no-op）：应用正常播放，混音台提示麦克风
+不可用。
+
+配置项：`mic_enabled`（默认开启）、`mic_gain_db`（−24 ~ 24，默认
+0）、`mic_echo`（0 ~ 1，默认 0.35）、`mic_bass_db` /
+`mic_treble_db`（−12 ~ 12，默认 0）、`mic_device`（输入设备名；
+留空 = 系统默认）。
+
+平台支持：Linux（PipeWire / PulseAudio）已支持并经过测试；
+Windows 暂不支持（需 WASAPI/MMDevice，另行开发）。
 
 ## 项目结构
 

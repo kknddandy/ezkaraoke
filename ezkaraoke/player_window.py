@@ -5,6 +5,8 @@ from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QKeyEvent, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -18,8 +20,10 @@ from PySide6.QtWidgets import (
 )
 
 from ezkaraoke import i18n
+from ezkaraoke.config import Config, save_config
 from ezkaraoke.frame_bridge import FrameBridge, video_output_mode
 from ezkaraoke.i18n import off_language_changed, on_language_changed, tr
+from ezkaraoke.mic_mixer import list_input_devices
 from ezkaraoke.player import PlayerController
 
 
@@ -93,14 +97,43 @@ class SeekSlider(QSlider):
 
 
 class PlayerWindow(QMainWindow):
-    def __init__(self, controller: PlayerController, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        controller: PlayerController,
+        parent: QWidget | None = None,
+        *,
+        config: Config | None = None,
+    ) -> None:
         super().__init__(parent)
         self._controller = controller
+        self._config = config
+        # Mic mixer panel: built on demand; the dialog reference (and the
+        # widget attributes below) are cleared when the dialog closes.
+        self._mixer_dialog: QDialog | None = None
+        self._mic_enable_btn: QPushButton | None = None
+        self._mic_gain_slider: QSlider | None = None
+        self._mic_gain_value: QLabel | None = None
+        self._mic_echo_slider: QSlider | None = None
+        self._mic_echo_value: QLabel | None = None
+        self._mic_bass_slider: QSlider | None = None
+        self._mic_bass_value: QLabel | None = None
+        self._mic_treble_slider: QSlider | None = None
+        self._mic_treble_value: QLabel | None = None
+        self._mic_device_combo: QComboBox | None = None
+        self._mic_status_label: QLabel | None = None
+        self._mic_status_timer: QTimer | None = None
         self.setWindowTitle(tr("ezkaraoke · 播放器"))
         self.resize(1024, 640)
         self._fs_timer = QTimer(self)
         self._fs_timer.setSingleShot(True)
         self._fs_timer.timeout.connect(self._hide_fs_controls)
+        # Coalesces save_config writes: a slider drag fires valueChanged
+        # many times, so the persistence write is deferred until the drag
+        # settles (single shot, ~400 ms).
+        self._mic_save_timer = QTimer(self)
+        self._mic_save_timer.setSingleShot(True)
+        self._mic_save_timer.setInterval(400)
+        self._mic_save_timer.timeout.connect(self._save_mic_config)
         self._banner_key = ""
 
         # Central widget with vertical layout: video + controls
@@ -203,6 +236,12 @@ class PlayerWindow(QMainWindow):
         self._btn_fullscreen.setToolTip(tr("全屏 (F11)"))
         self._btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         control_layout.addWidget(self._btn_fullscreen)
+
+        self._btn_mixer = QPushButton(tr("混音台"), self)
+        self._btn_mixer.setObjectName("ToolButton")
+        self._btn_mixer.setCheckable(True)
+        self._btn_mixer.toggled.connect(self._on_mixer_button_toggled)
+        control_layout.addWidget(self._btn_mixer)
 
         # Seek row: slider (stretch) + time label on its own row
         seek_row = QWidget(self)
@@ -496,6 +535,243 @@ class PlayerWindow(QMainWindow):
             self._show_fs_controls()
         return super().eventFilter(obj, event)
 
+    # ===== Mic mixer (混音台) =====
+
+    def _on_mixer_button_toggled(self, checked: bool) -> None:
+        """The toolbar button mirrors the dialog: checked == dialog open."""
+        if checked:
+            self._open_mixer_panel()
+        elif self._mixer_dialog is not None:
+            self._mixer_dialog.close()
+
+    def _open_mixer_panel(self) -> None:
+        """Build (or re-raise) the mic mixer dialog.
+
+        Mirrors the select window's loudness panel: one reusable
+        ``QDialog`` per window; the reference is cleared on ``finished``
+        so the next click builds a fresh one.
+        """
+        if self._mixer_dialog is not None:
+            self._mixer_dialog.raise_()
+            self._mixer_dialog.activateWindow()
+            return
+
+        cfg = self._config
+        enabled = bool(cfg.mic_enabled) if cfg is not None else True
+        gain = int(round(cfg.mic_gain_db)) if cfg is not None else 0
+        echo = int(round(cfg.mic_echo * 100.0)) if cfg is not None else 35
+        bass = int(round(cfg.mic_bass_db)) if cfg is not None else 0
+        treble = int(round(cfg.mic_treble_db)) if cfg is not None else 0
+        device = cfg.mic_device if cfg is not None else ""
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("混音台"))
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(8)
+
+        self._mic_enable_btn = QPushButton(tr("启用麦克风"), dlg)
+        self._mic_enable_btn.setObjectName("ToolButton")
+        self._mic_enable_btn.setCheckable(True)
+        self._mic_enable_btn.setChecked(enabled)
+        layout.addWidget(self._mic_enable_btn)
+
+        def slider_row(
+            title: str, minimum: int, maximum: int, value: int, fmt: str
+        ) -> tuple[QSlider, QLabel]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(title, dlg))
+            slider = QSlider(Qt.Horizontal, dlg)
+            slider.setRange(minimum, maximum)
+            slider.setSingleStep(1)
+            slider.setValue(value)
+            row.addWidget(slider, stretch=1)
+            value_label = QLabel(fmt.format(value), dlg)
+            value_label.setObjectName("StateLabel")
+            value_label.setFixedWidth(60)
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            row.addWidget(value_label)
+            layout.addLayout(row)
+            return slider, value_label
+
+        self._mic_gain_slider, self._mic_gain_value = slider_row(
+            tr("麦克风音量"), -24, 24, gain, "{:+d} dB"
+        )
+        self._mic_echo_slider, self._mic_echo_value = slider_row(
+            tr("回声"), 0, 100, echo, "{}%"
+        )
+        self._mic_bass_slider, self._mic_bass_value = slider_row(
+            tr("低音"), -12, 12, bass, "{:+d} dB"
+        )
+        self._mic_treble_slider, self._mic_treble_value = slider_row(
+            tr("高音"), -12, 12, treble, "{:+d} dB"
+        )
+
+        device_row = QHBoxLayout()
+        device_row.addWidget(QLabel(tr("输入设备"), dlg))
+        self._mic_device_combo = QComboBox(dlg)
+        # First item = system default; the rest carry the device NAME as
+        # item data (sounddevice treats strings as name prefixes, an index
+        # would be unstable across launches).
+        self._mic_device_combo.addItem(tr("系统默认"), "")
+        for _index, name in list_input_devices():
+            self._mic_device_combo.addItem(name, name)
+        index = self._mic_device_combo.findData(device)
+        if index >= 0:
+            self._mic_device_combo.setCurrentIndex(index)
+        elif device:
+            # The stored device is no longer in the list (unplugged or
+            # renamed): keep it as an extra selectable item so it is not
+            # silently reset to 系统默认 on the next change.
+            self._mic_device_combo.addItem(device, device)
+            self._mic_device_combo.setCurrentIndex(
+                self._mic_device_combo.count() - 1
+            )
+        device_row.addWidget(self._mic_device_combo, stretch=1)
+        layout.addLayout(device_row)
+
+        self._mic_status_label = QLabel(dlg)
+        self._mic_status_label.setObjectName("StateLabel")
+        layout.addWidget(self._mic_status_label)
+
+        warning = QLabel(tr("建议佩戴耳机，避免啸叫"), dlg)
+        warning.setObjectName("BannerLabel")
+        layout.addWidget(warning)
+
+        # All initial values are set before any signal is wired, so
+        # building the panel never fires a change handler.
+        self._mic_enable_btn.toggled.connect(self._on_mic_enabled_toggled)
+        self._mic_gain_slider.valueChanged.connect(self._on_mic_gain_changed)
+        self._mic_echo_slider.valueChanged.connect(self._on_mic_echo_changed)
+        self._mic_bass_slider.valueChanged.connect(self._on_mic_bass_changed)
+        self._mic_treble_slider.valueChanged.connect(self._on_mic_treble_changed)
+        self._mic_device_combo.currentIndexChanged.connect(
+            self._on_mic_device_changed
+        )
+
+        # The stream can only start/stop while the dialog is open (playback
+        # state transitions), so a short timer keeps the status line honest.
+        self._mic_status_timer = QTimer(dlg)
+        self._mic_status_timer.setInterval(500)
+        self._mic_status_timer.timeout.connect(self._update_mic_status)
+        self._mic_status_timer.start()
+
+        self._update_mic_status()
+
+        self._mixer_dialog = dlg
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+
+        def _on_dialog_finished(_result: int) -> None:
+            self._mixer_dialog = None
+            self._mic_enable_btn = None
+            self._mic_gain_slider = None
+            self._mic_gain_value = None
+            self._mic_echo_slider = None
+            self._mic_echo_value = None
+            self._mic_bass_slider = None
+            self._mic_bass_value = None
+            self._mic_treble_slider = None
+            self._mic_treble_value = None
+            self._mic_device_combo = None
+            self._mic_status_label = None
+            self._mic_status_timer = None
+            # Closing the dialog unchecks the toolbar button (signals
+            # blocked so the toggled slot never sees a stale dialog).
+            self._btn_mixer.blockSignals(True)
+            self._btn_mixer.setChecked(False)
+            self._btn_mixer.blockSignals(False)
+
+        dlg.finished.connect(_on_dialog_finished)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _save_mic_config(self) -> None:
+        """Persist the in-memory mic settings (no-op without a config).
+
+        Called by the debounce timer after a slider drag settles, and
+        immediately by the enable-toggle and device handlers (single user
+        actions, so nothing to coalesce). Cancels any pending debounced
+        write so an action never results in a double save.
+        """
+        self._mic_save_timer.stop()
+        if self._config is not None:
+            save_config(self._config)
+
+    def _on_mic_enabled_toggled(self, checked: bool) -> None:
+        self._controller.set_mic_enabled(checked)
+        if self._config is not None:
+            self._config.mic_enabled = checked
+        self._save_mic_config()
+        self._update_mic_status()
+
+    def _on_mic_gain_changed(self, value: int) -> None:
+        self._mic_gain_value.setText(f"{value:+d} dB")
+        self._apply_mic_settings()
+
+    def _on_mic_echo_changed(self, value: int) -> None:
+        self._mic_echo_value.setText(f"{value}%")
+        self._apply_mic_settings()
+
+    def _on_mic_bass_changed(self, value: int) -> None:
+        self._mic_bass_value.setText(f"{value:+d} dB")
+        self._apply_mic_settings()
+
+    def _on_mic_treble_changed(self, value: int) -> None:
+        self._mic_treble_value.setText(f"{value:+d} dB")
+        self._apply_mic_settings()
+
+    def _on_mic_device_changed(self, _index: int) -> None:
+        self._apply_mic_settings()
+        self._save_mic_config()
+
+    def _apply_mic_settings(self) -> None:
+        """Push the current mixer controls to the controller and persist.
+
+        The in-memory config is updated immediately; the ``save_config``
+        write is coalesced by the single-shot debounce timer so a slider
+        drag (many ``valueChanged`` signals) writes once.
+        """
+        device = self._mic_device_combo.currentData() or ""
+        enabled = self._mic_enable_btn.isChecked()
+        self._controller.configure_mic(
+            enabled=enabled,
+            gain_db=float(self._mic_gain_slider.value()),
+            echo=self._mic_echo_slider.value() / 100.0,
+            bass_db=float(self._mic_bass_slider.value()),
+            treble_db=float(self._mic_treble_slider.value()),
+            device=device,
+        )
+        if self._config is not None:
+            self._config.mic_enabled = enabled
+            self._config.mic_gain_db = float(self._mic_gain_slider.value())
+            self._config.mic_echo = self._mic_echo_slider.value() / 100.0
+            self._config.mic_bass_db = float(self._mic_bass_slider.value())
+            self._config.mic_treble_db = float(self._mic_treble_slider.value())
+            self._config.mic_device = device
+            self._mic_save_timer.start()  # debounced persistence
+        self._update_mic_status()
+
+    def _update_mic_status(self) -> None:
+        mixer = self._controller.mic_mixer
+        if mixer is None:
+            text = tr("麦克风不可用")
+        elif mixer.is_running():
+            text = tr("麦克风：已启用")
+        elif (
+            self._controller.state == "playing"
+            and self._mic_enable_btn is not None
+            and self._mic_enable_btn.isChecked()
+        ):
+            # Enabled and playing, yet the stream is not running: start()
+            # failed (or the DSP latched an error) -- say so instead of
+            # pretending the mic is simply off.
+            text = getattr(mixer, "last_error", None) or tr("麦克风不可用")
+        else:
+            # Stopped: "not running" is the normal condition.
+            text = tr("麦克风：未启用")
+        if self._mic_status_label is not None:
+            self._mic_status_label.setText(text)
+
     # ===== Language =====
 
     def retranslate(self) -> None:
@@ -509,6 +785,9 @@ class PlayerWindow(QMainWindow):
         self._btn_pitch_up.setText(tr("升调"))
         self._btn_track.setText(tr("原唱/伴奏"))
         self._btn_fullscreen.setToolTip(tr("全屏 (F11)"))
+        self._btn_mixer.setText(tr("混音台"))
+        if self._mixer_dialog is not None:
+            self._mixer_dialog.setWindowTitle(tr("混音台"))
         self._seek.setToolTip(tr("拖动或点击跳转播放位置"))
         self._update_state_label(self._controller.state)
         self._update_track_tooltip()

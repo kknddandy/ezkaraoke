@@ -145,6 +145,11 @@ class PlayerController(QObject):
         self._db = None
         self._loudness_enabled = True
         self._loudness_target = -11.25
+        # Mic mixing: created lazily (None = no mixer); the capture stream
+        # lives across songs and is driven by _sync_mic on state changes.
+        self._mic_mixer = None
+        self._mic_device = None  # input device the current mixer was built for
+        self._mic_enabled = False
 
     # ------------------------------------------------------------------ state
     @property
@@ -375,6 +380,8 @@ class PlayerController(QObject):
         if state != self._state:
             self._state = state
             self.state_changed.emit(state)
+            # Every playing/paused/stopped transition drives the mic.
+            self._sync_mic()
 
     def _begin_play(self, index: int) -> None:
         """Bookkeeping + playback start for *index* (a valid queue index)."""
@@ -876,6 +883,97 @@ class PlayerController(QObject):
             eq.set_preamp(gain)
             player.audio_set_equalizer(eq)
         except Exception:  # noqa: BLE001 - loudness must never break playback
+            pass
+
+    # ------------------------------------------------------------------- mic
+    def attach_mic_mixer(self, mixer) -> None:
+        """Inject the mic mixer (tests, future mixer window); None disables it.
+
+        Syncs immediately: injecting or replacing a mixer while playback is
+        running starts the stream right away instead of waiting for the
+        next state transition.
+        """
+        self._mic_mixer = mixer
+        self._sync_mic()
+
+    @property
+    def mic_mixer(self):
+        return self._mic_mixer
+
+    def configure_mic(
+        self,
+        *,
+        enabled: bool,
+        gain_db: float,
+        echo: float,
+        bass_db: float,
+        treble_db: float,
+        device: str = "",
+    ) -> None:
+        """Create or reuse the mic mixer and apply the parameters.
+
+        The capture stream itself stays closed until playback starts;
+        ``_sync_mic`` opens it on the first "playing" transition. Requesting
+        a different input device stops the old mixer and rebuilds it; the
+        same device reuses the existing one. Mic problems (missing deps,
+        PortAudio failure, a bad device) never crash startup: they are
+        swallowed and playback continues without the mic.
+        """
+        try:
+            want = device or None
+            if self._mic_mixer is None or want != self._mic_device:
+                old = self._mic_mixer
+                if old is not None:
+                    try:
+                        old.stop()
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Lazy import: sounddevice/numpy must never become a hard
+                # module-level dependency of the player.
+                from ezkaraoke.mic_mixer import MicMixer
+
+                self._mic_mixer = MicMixer(input_device=want)
+                self._mic_device = want
+            m = self._mic_mixer
+            m.set_gain_db(gain_db)
+            m.set_echo(echo)
+            m.set_bass_db(bass_db)
+            m.set_treble_db(treble_db)
+            self._mic_enabled = bool(enabled)
+            self._sync_mic()
+        except Exception:  # noqa: BLE001 - mic problems must never crash startup
+            pass
+
+    def set_mic_enabled(self, enabled: bool) -> None:
+        """Enable/disable mic mixing; syncs the stream with the state."""
+        self._mic_enabled = bool(enabled)
+        self._sync_mic()
+
+    def _sync_mic(self) -> None:
+        """Drive the mic stream from the playback state.
+
+        playing: start (once — the stream persists between songs) + unmute;
+        paused:  mute (the stream stays open);
+        stopped: close the stream.
+        Mic problems never break playback.
+        """
+        try:
+            m = self._mic_mixer
+            if m is None:
+                return
+            if not self._mic_enabled:
+                m.stop()
+                return
+            if self._state == "playing":
+                if not m.is_running():
+                    if not m.start():  # no mic / deps missing / dummy audio
+                        return  # normal: keep playing without the mic
+                m.set_muted(False)
+            elif self._state == "paused":
+                m.set_muted(True)
+            else:  # stopped
+                m.stop()
+        except Exception:  # noqa: BLE001 - mic problems never break playback
             pass
 
     # ------------------------------------------------------------------ pitch

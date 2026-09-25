@@ -20,6 +20,12 @@ class Config:
     loudness_enabled: bool = True
     loudness_target: float = -11.25      # allowed -30 .. -5
     loudness_workers: int = 8            # allowed 0 .. 16; 0 = auto (cpu/2)
+    mic_enabled: bool = True
+    mic_gain_db: float = 0.0             # allowed -24 .. 24
+    mic_echo: float = 0.35               # allowed 0.0 .. 1.0
+    mic_bass_db: float = 0.0             # allowed -12 .. 12
+    mic_treble_db: float = 0.0           # allowed -12 .. 12
+    mic_device: str = ""                 # PortAudio input index/name; "" = system default
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -65,6 +71,48 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         or not 0 <= loudness_workers <= 16
     ):
         loudness_workers = 8
+    mic_enabled = data.get("mic_enabled", True)
+    if not isinstance(mic_enabled, bool):
+        mic_enabled = True
+    mic_gain_db = data.get("mic_gain_db", 0.0)
+    if (
+        isinstance(mic_gain_db, bool)
+        or not isinstance(mic_gain_db, (int, float))
+        or not -24 <= mic_gain_db <= 24
+    ):
+        mic_gain_db = 0.0
+    else:
+        mic_gain_db = float(mic_gain_db)
+    mic_echo = data.get("mic_echo", 0.35)
+    if (
+        isinstance(mic_echo, bool)
+        or not isinstance(mic_echo, (int, float))
+        or not 0.0 <= mic_echo <= 1.0
+    ):
+        mic_echo = 0.35
+    else:
+        mic_echo = float(mic_echo)
+    mic_bass_db = data.get("mic_bass_db", 0.0)
+    if (
+        isinstance(mic_bass_db, bool)
+        or not isinstance(mic_bass_db, (int, float))
+        or not -12 <= mic_bass_db <= 12
+    ):
+        mic_bass_db = 0.0
+    else:
+        mic_bass_db = float(mic_bass_db)
+    mic_treble_db = data.get("mic_treble_db", 0.0)
+    if (
+        isinstance(mic_treble_db, bool)
+        or not isinstance(mic_treble_db, (int, float))
+        or not -12 <= mic_treble_db <= 12
+    ):
+        mic_treble_db = 0.0
+    else:
+        mic_treble_db = float(mic_treble_db)
+    mic_device = data.get("mic_device", "")
+    if not isinstance(mic_device, str):
+        mic_device = ""
     return Config(
         music_folder=music_folder,
         db_path=db_path,
@@ -73,6 +121,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         loudness_enabled=loudness_enabled,
         loudness_target=loudness_target,
         loudness_workers=loudness_workers,
+        mic_enabled=mic_enabled,
+        mic_gain_db=mic_gain_db,
+        mic_echo=mic_echo,
+        mic_bass_db=mic_bass_db,
+        mic_treble_db=mic_treble_db,
+        mic_device=mic_device,
     )
 
 

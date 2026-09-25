@@ -197,21 +197,22 @@ def pending_files(
     *,
     force: bool = False,
     stop_event: threading.Event | None = None,
-) -> list[tuple[str, int, int, float]]:
-    """(path, track_pos, size, mtime) entries that need measurement.
+) -> list[tuple[str, int, float, set[int]]]:
+    """(path, size, mtime, matching) entries that need measurement.
 
     For every song the file is statted (missing files are skipped) and the
     enumeration stops early when *stop_event* is set. A file is a candidate
     when *force* is set, when it has no stored loudness rows, or when any
     stored row's (size, mtime) snapshot differs from the current one --
     including rows with ok=0 (a deliberate failure whose snapshot matches
-    is NOT retried). For candidates, one entry is emitted per track
-    position lacking a snapshot-matching row (all positions when *force*).
-    A file with no audio tracks at all yields one placeholder entry for
-    track 0: the worker records an ok=0 row with a real snapshot, so it is
-    final and never pends again.
+    is NOT retried). ``matching`` is the set of track positions whose
+    stored row already matches the current snapshot (empty when *force*):
+    the worker re-measures only the remaining positions.
+    Enumeration deliberately does NOT call ffprobe/audio_track_count, so a
+    huge library enumerates in pure stat+DB time and the worker knows its
+    total before the measurement pool starts.
     """
-    pending: list[tuple[str, int, int, float]] = []
+    pending: list[tuple[str, int, float, set[int]]] = []
     for (path,) in conn.execute("SELECT path FROM songs"):
         if stop_event is not None and stop_event.is_set():
             break
@@ -225,32 +226,53 @@ def pending_files(
             (path,),
         ).fetchall()
         if force:
-            count = audio_track_count(path)
+            matching: set[int] = set()
         else:
-            if rows and all(r[1] == size and r[2] == mtime for r in rows):
-                continue
-            count = audio_track_count(path)
-        if count == 0:
-            pending.append((path, 0, size, mtime))
-            continue
-        if force:
-            positions = range(count)
-        else:
-            matching = {r[0] for r in rows if r[1] == size and r[2] == mtime}
-            positions = (p for p in range(count) if p not in matching)
-        for pos in positions:
-            pending.append((path, pos, size, mtime))
+            matching = {
+                track_pos
+                for (track_pos, row_size, row_mtime) in rows
+                if row_size == size and row_mtime == mtime
+            }
+            if rows and all(
+                row_size == size and row_mtime == mtime
+                for (_track_pos, row_size, row_mtime) in rows
+            ):
+                continue  # every stored row matches: not a candidate
+        pending.append((path, size, mtime, matching))
     return pending
 
 
-def _measure_path(path, positions, stop_event):
-    """Measure all pending track positions of one file.
+def _measure_path(
+    path: str,
+    matching: set[int],
+    force: bool,
+    stop_event: threading.Event | None,
+) -> dict[int, LoudnessResult | None] | None:
+    """Measure one file's pending tracks; ffprobe runs HERE, in the pool.
 
-    Returns {pos: LoudnessResult | None} (a None value = genuine measurement
-    failure for that track), or None when *stop_event* fired mid-way so the
-    caller must discard the partial result and leave prior rows untouched.
+    *matching* is the set of track positions whose stored row already
+    matches the current (size, mtime) snapshot; only the remaining
+    positions are measured (all of them when *force*). Returns
+    {pos: LoudnessResult | None} (a None value = genuine measurement
+    failure for that track), {0: None} for a file with no audio tracks
+    (recorded once as a final failure, never re-queued), {} when no
+    position needed measuring, or None when *stop_event* fired mid-way so
+    the caller must discard the partial result and leave prior rows
+    untouched.
     """
-    out = {}
+    if stop_event is not None and stop_event.is_set():
+        return None
+    count = audio_track_count(path)
+    if count == 0:
+        return {0: None}
+    positions = (
+        list(range(count))
+        if force
+        else [p for p in range(count) if p not in matching]
+    )
+    if not positions:
+        return {}
+    out: dict[int, LoudnessResult | None] = {}
     for pos in positions:
         if stop_event is not None and stop_event.is_set():
             return None
@@ -338,34 +360,38 @@ class LoudnessWorker(threading.Thread):
                 conn.commit()
                 # (0, 0) means "enumerating"; (0, total) follows below
                 self._signals.progress.emit(0, 0)
-                items = pending_files(
+                candidates = pending_files(
                     conn, force=self.force, stop_event=self._stop
                 )
-                total = len(items)
+                # total is per FILE: enumeration is stat+DB only (no
+                # ffprobe), so it is known almost immediately even for a
+                # huge library.
+                total = len(candidates)
                 self._signals.progress.emit(0, total)
-                # One future per path: all pending tracks of a file are
-                # measured and written atomically, so a stop() can never
-                # leave a partial row set (or ok=0 poison rows) behind.
-                expected: dict[str, list[int]] = {}
-                for path, pos, _size, _mtime in items:
-                    expected.setdefault(path, []).append(pos)
+                # One future per file: ffprobe + measurement of the
+                # pending tracks run in the pool and each file's rows are
+                # written atomically, so a stop() can never leave a
+                # partial row set (or ok=0 poison rows) behind.
                 done = 0
                 pool = concurrent.futures.ThreadPoolExecutor(
                     max_workers=max(1, self.workers)
                 )
                 try:
                     futures = {}
-                    for path, positions in expected.items():
-                        positions.sort()
+                    for path, _size, _mtime, matching in candidates:
                         futures[
                             pool.submit(
-                                _measure_path, path, positions, self._stop
+                                _measure_path,
+                                path,
+                                matching,
+                                self.force,
+                                self._stop,
                             )
-                        ] = (path, positions)
+                        ] = path
                     for future in concurrent.futures.as_completed(futures):
                         if self._stop.is_set():
                             break  # never consume a stopped future
-                        path, positions = futures[future]
+                        path = futures[future]
                         try:
                             results = future.result()
                         except Exception:
@@ -373,7 +399,7 @@ class LoudnessWorker(threading.Thread):
                         if results is None:
                             # Killed by stop (or a hard error): leave the
                             # row(s) untouched so the file re-pends.
-                            done += len(positions)
+                            done += 1
                             self._signals.progress.emit(done, total)
                             continue
                         try:
@@ -391,7 +417,7 @@ class LoudnessWorker(threading.Thread):
                                 "AND NOT (size = ? AND mtime = ?)",
                                 (path, size, mtime),
                             )
-                        for pos in positions:
+                        for pos in sorted(results):
                             result = results[pos]
                             row = LoudnessRow(
                                 path=path,
@@ -421,7 +447,7 @@ class LoudnessWorker(threading.Thread):
                                 ),
                             )
                         prev_done = done
-                        done += len(positions)
+                        done += 1
                         if done // self._FLUSH_EVERY > prev_done // self._FLUSH_EVERY:
                             conn.commit()
                         self._signals.progress.emit(done, total)

@@ -1480,3 +1480,246 @@ def test_loudness_row_lookup_clamps_track_index(loudness):
     p._audio_track_index = 5
     p._apply_loudness_gain()
     assert eqs[-1].preamp == pytest.approx(8.75)  # row 0's gain
+
+
+# ---------------------------------------------------------------------- mic
+class _FakeMicMixer:
+    """Records stream-control calls; ``start_ok`` configures start().
+
+    No real audio device is involved: start() flips an internal flag and
+    is_running() reports it, mirroring MicMixer's contract.
+    """
+
+    def __init__(self, start_ok: bool = True) -> None:
+        self.start_ok = start_ok
+        self.running = False
+        self.started = 0
+        self.stopped = 0
+        self.mutes: list[bool] = []
+        self.params: dict[str, float] = {}
+
+    def start(self) -> bool:
+        self.started += 1
+        if not self.start_ok:
+            return False
+        self.running = True
+        return True
+
+    def stop(self) -> None:
+        self.stopped += 1
+        self.running = False
+
+    def set_muted(self, muted: bool) -> None:
+        self.mutes.append(bool(muted))
+
+    def is_running(self) -> bool:
+        return self.running
+
+    def set_gain_db(self, db: float) -> None:
+        self.params["gain_db"] = float(db)
+
+    def set_echo(self, amount: float) -> None:
+        self.params["echo"] = float(amount)
+
+    def set_bass_db(self, db: float) -> None:
+        self.params["bass_db"] = float(db)
+
+    def set_treble_db(self, db: float) -> None:
+        self.params["treble_db"] = float(db)
+
+
+def test_mic_starts_on_play_and_stops_on_stop(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)  # stopped: no stream yet, just a stop() no-op
+    p.play_at(0)
+    assert fake.started == 1
+    assert fake.running is True
+    assert fake.mutes == [False]  # unmuted on start
+    p.stop()
+    assert fake.stopped >= 1
+    assert fake.running is False
+
+
+def test_mic_not_restarted_between_songs(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)
+    p.play_at(0)
+    p.next()  # state stays "playing": the stream must NOT restart
+    assert fake.started == 1
+    assert p.current_index == 1
+    assert p.is_playing
+    p.stop()
+    assert fake.stopped >= 1
+    assert fake.running is False
+
+
+def test_mic_mutes_on_pause_resumes_on_play(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)
+    p.play_at(0)
+    stopped_before_pause = fake.stopped
+    p.toggle_pause()
+    assert fake.mutes == [False, True]
+    # pause mutes; it does NOT close the stream (no new stop() on pause)
+    assert fake.stopped == stopped_before_pause
+    assert fake.running is True
+    p.toggle_pause()
+    assert fake.mutes == [False, True, False]
+    assert fake.started == 1  # resume does not restart the stream
+    p.stop()
+
+
+def test_mic_start_failure_is_tolerated(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer(start_ok=False)
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)
+    p.play_at(0)  # must not raise even though the mic cannot start
+    assert p.is_playing  # playback continues without the mic
+    assert fake.started == 1
+    assert fake.mutes == []  # never (un)muted when the stream never opened
+    p.stop()
+
+
+def test_mic_disabled_never_starts(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(False)
+    p.play_at(0)
+    assert fake.started == 0
+    assert fake.mutes == []
+    assert p.is_playing
+    # enabling mid-play starts the stream...
+    p.set_mic_enabled(True)
+    assert fake.started == 1
+    assert fake.mutes == [False]
+    # ...and disabling while running stops it
+    p.set_mic_enabled(False)
+    assert fake.stopped >= 1
+    assert fake.running is False
+    p.stop()
+
+
+def test_configure_mic_applies_params(qapp):
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)  # injected first: configure_mic must reuse it
+    p.configure_mic(
+        enabled=True,
+        gain_db=6.0,
+        echo=0.5,
+        bass_db=3.0,
+        treble_db=-2.0,
+        device="",
+    )
+    assert p.mic_mixer is fake
+    assert fake.params == {
+        "gain_db": 6.0,
+        "echo": 0.5,
+        "bass_db": 3.0,
+        "treble_db": -2.0,
+    }
+    assert p._mic_enabled is True
+
+
+def test_mic_closes_at_end_of_queue(qapp):
+    # Advancing past the last song stops playback; the mic stream must close.
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)
+    p.play_at(0)
+    assert fake.is_running() is True
+    p.next()  # past the only song -> stop()
+    assert not p.is_playing
+    assert p.current_index == -1
+    assert fake.stopped >= 1
+    assert fake.is_running() is False
+
+
+def test_mic_unmutes_without_restart_when_switching_from_pause(qapp):
+    # Switching songs while paused goes paused->playing via _begin_play;
+    # the mic must unmute but NOT restart the (still open) stream.
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.set_mic_enabled(True)
+    p.play_at(0)
+    p.toggle_pause()  # paused -> mute
+    assert fake.mutes[-1] is True
+    p.play_at(1)  # paused -> playing via _begin_play
+    assert p.current_index == 1
+    assert p.is_playing
+    assert fake.started == 1  # no restart
+    assert fake.mutes[-1] is False  # last mute state is False (unmuted)
+    assert fake.is_running() is True
+    p.stop()
+
+
+def test_configure_mic_while_playing_starts_stream(qapp):
+    # Enabling the mic via configure_mic while already playing must start the
+    # stream immediately (no wait for the next state transition).
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    fake = _FakeMicMixer()
+    p.attach_mic_mixer(fake)
+    p.play_at(0)  # mic disabled: nothing starts yet
+    assert p.is_playing
+    assert fake.started == 0
+    p.configure_mic(
+        enabled=True,
+        gain_db=0,
+        echo=0.3,
+        bass_db=0,
+        treble_db=0,
+        device="",
+    )
+    assert fake.started == 1  # configuring while playing starts the stream
+    assert fake.is_running() is True
+    assert fake.params == {
+        "gain_db": 0.0,
+        "echo": 0.3,
+        "bass_db": 0.0,
+        "treble_db": 0.0,
+    }
+    p.stop()
+
+
+def test_real_mixer_noop_under_dummy_audio(qapp, monkeypatch):
+    # A REAL MicMixer (not a fake) under dummy audio: configuring and playing
+    # must not raise, and the capture stream must stay closed.
+    from ezkaraoke.mic_mixer import MicMixer
+
+    monkeypatch.setenv("EZKARAOKE_DUMMY_AUDIO", "1")
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.configure_mic(
+        enabled=True,
+        gain_db=0,
+        echo=0.3,
+        bass_db=0,
+        treble_db=0,
+        device="",
+    )
+    assert isinstance(p.mic_mixer, MicMixer)  # a real mixer was created
+    p.play_at(0)  # must not raise
+    assert p.is_playing
+    assert p.mic_mixer.is_running() is False  # dummy audio: stream stays closed
+    p.stop()

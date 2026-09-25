@@ -104,6 +104,19 @@ _EN: dict[str, str] = {
         "background, about 1 minute)"
     ),
     "缺少 ffmpeg：变调同时改变速度": "ffmpeg missing: pitch shift also changes tempo",
+    # ---- mic mixer (混音台)
+    "混音台": "Mixer",
+    "启用麦克风": "Enable mic",
+    "麦克风音量": "Mic volume",
+    "回声": "Echo",
+    "低音": "Bass",
+    "高音": "Treble",
+    "输入设备": "Input device",
+    "系统默认": "System default",
+    "麦克风：已启用": "Mic: enabled",
+    "麦克风：未启用": "Mic: disabled",
+    "麦克风不可用": "Mic unavailable",
+    "建议佩戴耳机，避免啸叫": "Wear headphones to avoid feedback",
     # ---- loudness normalization
     "响度对齐": "Loudness",
     "正在测量响度": "Measuring loudness",

@@ -291,6 +291,16 @@ class SelectWindow(QMainWindow):
         self._controller.attach_database(self._db)
         self._controller.set_loudness_enabled(self._config.loudness_enabled)
         self._controller.set_loudness_target(self._config.loudness_target)
+        # Mic: build the mixer from the persisted config. The stream stays
+        # closed until playback starts (the player syncs it with the state).
+        self._controller.configure_mic(
+            enabled=self._config.mic_enabled,
+            gain_db=self._config.mic_gain_db,
+            echo=self._config.mic_echo,
+            bass_db=self._config.mic_bass_db,
+            treble_db=self._config.mic_treble_db,
+            device=self._config.mic_device,
+        )
         self._scan_worker: ScanWorker | None = None
         self._avatar_worker: AvatarWorker | None = None
         self._avatar_renderer: AvatarRenderer | None = None

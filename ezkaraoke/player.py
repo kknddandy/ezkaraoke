@@ -8,6 +8,7 @@ becomes a no-op and ``status_message`` is emitted once.
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 import threading
 from ctypes.util import find_library
@@ -199,7 +200,14 @@ class PlayerController(QObject):
         try:
             import vlc
 
-            self._vlc = vlc.Instance()
+            # Tests set EZKARAOKE_DUMMY_AUDIO=1 (tests/conftest.py) so the
+            # suite's generated media never reaches the real speakers.
+            vlc_args = (
+                ["--aout=dummy"]
+                if os.environ.get("EZKARAOKE_DUMMY_AUDIO") == "1"
+                else []
+            )
+            self._vlc = vlc.Instance(*vlc_args)
             self._player = self._vlc.media_player_new()
         except Exception:  # ImportError/OSError/TypeError/NameError ...
             self._vlc_available = False
@@ -671,6 +679,40 @@ class PlayerController(QObject):
             self._current_index = -1
             self.current_changed.emit(-1)
         self._set_state("stopped")
+
+    # ------------------------------------------------------- position & seek
+    def playback_position_ms(self) -> int:
+        """Current playback position in milliseconds; -1 when unknown."""
+        if self._player is None:
+            return -1
+        try:
+            position = self._player.get_time()
+        except Exception:  # noqa: BLE001
+            return -1
+        return int(position) if position is not None and position >= 0 else -1
+
+    def media_length_ms(self) -> int:
+        """Length of the current media in milliseconds; -1 when unknown."""
+        if self._player is None:
+            return -1
+        try:
+            length = self._player.get_length()
+        except Exception:  # noqa: BLE001
+            return -1
+        return int(length) if length is not None and length >= 0 else -1
+
+    def seek_to_ms(self, ms: int) -> None:
+        """Seek the current media to *ms* (clamped to >= 0). No-op without a player."""
+        if self._player is None:
+            return
+        try:
+            self._player.set_time(max(0, int(ms)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def can_seek(self) -> bool:
+        """True when the current media has a known, non-zero length."""
+        return self.media_length_ms() > 0
 
     def set_video_output(self, hwnd: int) -> bool:
         """Attach the video output to *hwnd*. False if libvlc is missing."""

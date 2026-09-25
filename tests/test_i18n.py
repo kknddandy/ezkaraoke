@@ -258,3 +258,54 @@ def test_player_window_replay_button(qapp):
     finally:
         win.close()
         qapp.processEvents()
+
+
+def test_player_window_progress_bar(qapp, monkeypatch):
+    controller = PlayerController()
+    win = PlayerWindow(controller)
+    win.show()
+    qapp.processEvents()
+    try:
+        # The bar must be a horizontal slider (regression: a parent-only
+        # QSlider() defaults to vertical and rendered as a thin strip)
+        assert win._seek.orientation() == Qt.Horizontal
+
+        # Unknown length: slider disabled, placeholder label
+        win._update_progress()
+        assert not win._seek.isEnabled()
+        assert win._time_label.text() == "-:-- / -:--"
+
+        # A 60 s track at the 15 s mark
+        monkeypatch.setattr(controller, "media_length_ms", lambda: 60000)
+        monkeypatch.setattr(controller, "playback_position_ms", lambda: 15000)
+        win._update_progress()
+        assert win._seek.isEnabled()
+        assert win._seek.minimum() == 0
+        assert win._seek.maximum() == 60000
+        assert win._seek.value() == 15000
+        assert win._time_label.text() == "0:15 / 1:00"
+
+        # Seeking from the slider reaches the controller
+        seeks: list[int] = []
+        monkeypatch.setattr(controller, "seek_to_ms", lambda ms: seeks.append(ms))
+        win._seek.seekRequested.emit(42000)
+        assert seeks == [42000]
+        assert win._time_label.text() == "0:42 / 1:00"
+
+        # Dragging updates the label live without seeking yet;
+        # releasing seeks to the dragged position
+        win._on_slider_moved(20000)
+        assert win._time_label.text() == "0:20 / 1:00"
+        assert seeks == [42000]
+        win._on_slider_released(20000)
+        assert seeks == [42000, 20000]
+
+        # Unknown length again: back to the disabled placeholder
+        monkeypatch.setattr(controller, "media_length_ms", lambda: -1)
+        win._update_progress()
+        assert not win._seek.isEnabled()
+        assert win._time_label.text() == "-:-- / -:--"
+        win._seek.seekRequested.emit(5000)  # must not crash
+    finally:
+        win.close()
+        qapp.processEvents()

@@ -53,6 +53,7 @@ class FakePlayer:
         self.length = length
         self.position = position
         self.equalizers: list = []
+        self.seeks: list[int] = []
         # stand-in for python-vlc's _Ctype ctypes protocol attribute
         self._as_parameter_ = object()
 
@@ -97,6 +98,11 @@ class FakePlayer:
 
     def get_time(self) -> int:
         return self.position
+
+    def set_time(self, ms: int) -> int:
+        self.seeks.append(ms)
+        self.position = ms
+        return 0
 
     def event_manager(self) -> "_FakeEventManager":
         return _FakeEventManager()
@@ -970,6 +976,55 @@ def test_play_methods_noop_without_libvlc(qapp):
     assert p.current_index == 1
     p.stop()
     assert p.current_index == -1
+
+
+# ------------------------------------------------------ position & seek
+def test_position_and_length_without_player(qapp):
+    p = PlayerController()
+    assert p.playback_position_ms() == -1
+    assert p.media_length_ms() == -1
+    assert p.can_seek() is False
+    p.seek_to_ms(12345)  # no-op without a player, must not raise
+    p.seek_to_ms(-1)
+
+
+def test_position_and_length_unknown(qapp):
+    p = PlayerController()
+    p._player = FakePlayer(length=-1, position=-1)
+    assert p.playback_position_ms() == -1
+    assert p.media_length_ms() == -1
+    assert p.can_seek() is False
+
+
+def test_position_and_length_pass_through(qapp):
+    p = PlayerController()
+    p._player = FakePlayer(length=60000, position=15000)
+    assert p.playback_position_ms() == 15000
+    assert p.media_length_ms() == 60000
+    assert p.can_seek() is True
+
+
+def test_seek_to_ms_passes_through_and_clamps(qapp):
+    p = PlayerController()
+    fake = FakePlayer(length=60000, position=15000)
+    p._player = fake
+    p.seek_to_ms(30000)
+    assert fake.seeks == [30000]
+    p.seek_to_ms(-5000)  # a negative seek clamps to 0
+    assert fake.seeks == [30000, 0]
+    assert fake.position == 0
+
+
+def test_seek_to_ms_never_raises(qapp):
+    class BrokenPlayer:
+        def set_time(self, ms: int) -> None:
+            raise RuntimeError("boom")
+
+    p = PlayerController()
+    p._player = BrokenPlayer()
+    p.seek_to_ms(1000)  # libvlc failures must stay silent
+    p.playback_position_ms()
+    p.media_length_ms()
 
 
 # -------------------------------------------------------- audio track toggle

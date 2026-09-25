@@ -1,7 +1,7 @@
 from pathlib import Path
 import sys
 
-from PySide6.QtCore import QEvent, Qt, QTimer
+from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QKeyEvent, QMouseEvent, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QSlider,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -49,6 +51,45 @@ class VideoArea(QWidget):
             if isinstance(window, PlayerWindow):
                 window.toggle_fullscreen()
         super().mouseDoubleClickEvent(event)
+
+
+def _format_time_ms(ms: int) -> str:
+    """Milliseconds as 'm:ss', or 'h:mm:ss' when the time reaches one hour."""
+    total = max(0, int(ms)) // 1000
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+class SeekSlider(QSlider):
+    """Horizontal seek slider for the player window.
+
+    A press anywhere on the groove jumps to that position immediately
+    (emitting ``seekRequested``); the usual drag/release signals
+    (``sliderMoved`` / ``sliderReleased``) keep working so the window can
+    update the time label live while dragging and seek on release.
+    """
+
+    seekRequested = Signal(int)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if (
+            event.button() == Qt.LeftButton
+            and self.isEnabled()
+            and self.width() > 0
+            and self.maximum() > self.minimum()
+        ):
+            value = QStyle.sliderValueFromPosition(
+                self.minimum(),
+                self.maximum(),
+                int(event.position().x()),
+                self.width(),
+            )
+            self.setValue(value)
+            self.seekRequested.emit(value)
+        super().mousePressEvent(event)
 
 
 class PlayerWindow(QMainWindow):
@@ -163,8 +204,29 @@ class PlayerWindow(QMainWindow):
         self._btn_fullscreen.clicked.connect(self.toggle_fullscreen)
         control_layout.addWidget(self._btn_fullscreen)
 
-        self._control_bar = control_bar
-        layout.addWidget(control_bar)
+        # Seek row: slider (stretch) + time label on its own row
+        seek_row = QWidget(self)
+        seek_layout = QHBoxLayout(seek_row)
+        seek_layout.setContentsMargins(0, 0, 0, 0)
+        seek_layout.setSpacing(10)
+        self._seek = SeekSlider(Qt.Horizontal, seek_row)
+        self._seek.setRange(0, 0)
+        self._seek.setEnabled(False)
+        self._seek.setToolTip(tr("拖动或点击跳转播放位置"))
+        seek_layout.addWidget(self._seek, stretch=1)
+        self._time_label = QLabel("-:-- / -:--", self)
+        self._time_label.setObjectName("TimeLabel")
+        seek_layout.addWidget(self._time_label)
+
+        # Seek row above the existing bottom control bar
+        controls = QWidget(self)
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(6)
+        controls_layout.addWidget(seek_row)
+        controls_layout.addWidget(control_bar)
+        self._control_bar = controls
+        layout.addWidget(controls)
 
         # Software video output bridge (created on demand for Wayland /
         # X11 fallback; kept alive for the lifetime of this window).
@@ -184,6 +246,17 @@ class PlayerWindow(QMainWindow):
         self._update_pitch_tooltip()
         self._update_pitch_label()
 
+        self._seek.seekRequested.connect(self._on_seek_requested)
+        self._seek.sliderMoved.connect(self._on_slider_moved)
+        self._seek.sliderReleased.connect(self._on_slider_released)
+
+        # Poll the controller a few times a second to keep the seek row in
+        # step with playback (skipped while the user drags the handle).
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(500)
+        self._progress_timer.timeout.connect(self._update_progress)
+        self._progress_timer.start()
+
         # Re-translate every label when the language changes.
         on_language_changed(self.retranslate)
 
@@ -191,6 +264,7 @@ class PlayerWindow(QMainWindow):
         QTimer.singleShot(0, self._setup_video_output)
 
         self._update_from_controller()
+        self._update_progress()
 
     def _setup_video_output(self) -> None:
         platform = QGuiApplication.platformName()
@@ -221,6 +295,7 @@ class PlayerWindow(QMainWindow):
     def _on_current_changed(self, index: int) -> None:
         if index == -1:
             self._frame_label.clear()
+            self._reset_progress()
         self._update_from_controller()
         self._btn_track.setEnabled(self._controller.is_playing and self._controller.has_multi_audio_track())
 
@@ -239,6 +314,7 @@ class PlayerWindow(QMainWindow):
         self._update_state_label(state)
         if state not in ("playing", "paused"):
             self._frame_label.clear()
+            self._reset_progress()
         self._btn_track.setEnabled(self._controller.is_playing and self._controller.has_multi_audio_track())
 
     def _update_track_tooltip(self) -> None:
@@ -314,6 +390,60 @@ class PlayerWindow(QMainWindow):
             self._title_label.setText(tr("未在播放"))
             self._position_label.setText("- / -")
 
+    # ===== Progress / seek =====
+
+    def _update_progress(self) -> None:
+        """Poll the controller and refresh the seek row.
+
+        Skipped while the user is dragging the handle (the drag itself is
+        reflected live by ``sliderMoved``).
+        """
+        if self._seek.isSliderDown():
+            return
+        length = self._controller.media_length_ms()
+        if length <= 0:
+            self._reset_progress()
+            return
+        position = self._controller.playback_position_ms()
+        if position < 0:
+            position = 0
+        position = min(position, length)
+        self._seek.setRange(0, length)
+        self._seek.setEnabled(True)
+        self._seek.setValue(position)
+        self._time_label.setText(
+            f"{_format_time_ms(position)} / {_format_time_ms(length)}"
+        )
+
+    def _reset_progress(self) -> None:
+        """Nothing playing / unknown duration: slider off, '-:-- / -:--'."""
+        self._seek.setRange(0, 0)
+        self._seek.setValue(0)
+        self._seek.setEnabled(False)
+        self._time_label.setText("-:-- / -:--")
+
+    def _on_seek_requested(self, ms: int) -> None:
+        """Press on the groove: seek immediately and update the label."""
+        length = self._controller.media_length_ms()
+        if length > 0:
+            self._time_label.setText(
+                f"{_format_time_ms(ms)} / {_format_time_ms(length)}"
+            )
+        self._controller.seek_to_ms(ms)
+
+    def _on_slider_moved(self, value: int) -> None:
+        """Live label update while dragging; the seek happens on release."""
+        length = self._seek.maximum()
+        if length <= 0:
+            return
+        self._time_label.setText(
+            f"{_format_time_ms(value)} / {_format_time_ms(length)}"
+        )
+
+    def _on_slider_released(self, value: int) -> None:
+        """Seek to the position where the handle was released."""
+        self._controller.seek_to_ms(value)
+
     # ===== Fullscreen =====
 
     def toggle_fullscreen(self) -> None:
@@ -379,6 +509,7 @@ class PlayerWindow(QMainWindow):
         self._btn_pitch_up.setText(tr("升调"))
         self._btn_track.setText(tr("原唱/伴奏"))
         self._btn_fullscreen.setToolTip(tr("全屏 (F11)"))
+        self._seek.setToolTip(tr("拖动或点击跳转播放位置"))
         self._update_state_label(self._controller.state)
         self._update_track_tooltip()
         self._update_pitch_tooltip()
@@ -401,6 +532,7 @@ class PlayerWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._progress_timer.stop()
         if self._bridge is not None:
             self._controller.detach_video_callbacks()
         self._controller.shutdown_shift()

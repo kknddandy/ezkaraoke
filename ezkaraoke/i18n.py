@@ -95,6 +95,7 @@ _EN: dict[str, str] = {
     "全屏": "Fullscreen",
     "全屏 (F11)": "Fullscreen (F11)",
     "退出全屏": "Exit Fullscreen",
+    "拖动或点击跳转播放位置": "Drag or click to seek",
     "警告：无法设置视频输出（请确认 VLC 已安装）": (
         "Warning: cannot set up video output (make sure VLC is installed)"
     ),

@@ -61,6 +61,11 @@ QLabel#StateLabel {
     background-color: #1e1e2f;
 }
 
+QLabel#TimeLabel {
+    color: #a0a0b0;
+    font-size: 13px;
+}
+
 /* ===== Buttons ===== */
 QPushButton {
     background-color: #1e1e2f;
@@ -252,6 +257,48 @@ QPushButton#ModeButton:checked { background-color: #e8a030; color: #0c0c14; bord
 
 /* Pitch label in player control bar */
 QLabel#PitchLabel { color: #e8a030; font-size: 13px; padding: 2px 8px; border-radius: 4px; background-color: #1e1e2f; }
+
+/* ===== Seek slider (player window) ===== */
+QSlider {
+    background: transparent;
+    min-height: 18px;
+}
+
+QSlider::groove:horizontal {
+    height: 4px;
+    background-color: #1e1e2f;
+    border-radius: 2px;
+}
+
+QSlider::sub-page:horizontal {
+    background-color: #e8a030;
+    border-radius: 2px;
+}
+
+QSlider::add-page:horizontal {
+    background-color: #1e1e2f;
+    border-radius: 2px;
+}
+
+QSlider::handle:horizontal {
+    background-color: #e8a030;
+    width: 12px;
+    height: 12px;
+    margin: -4px 0;
+    border-radius: 6px;
+}
+
+QSlider::handle:horizontal:hover {
+    background-color: #f0b040;
+}
+
+QSlider::handle:horizontal:disabled {
+    background-color: #555566;
+}
+
+QSlider:disabled::sub-page:horizontal {
+    background-color: #2a2a3e;
+}
 
 /* ===== Scrollbars ===== */
 QScrollBar:vertical {

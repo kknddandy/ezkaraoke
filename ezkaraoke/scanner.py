@@ -38,6 +38,19 @@ def parse_filename(name: str) -> tuple[str, str]:
     return artist, title
 
 
+def parse_version(name: str) -> str:
+    """Version label from a ``歌手-歌名-版本`` filename.
+
+    Everything after the second "-" is the version (e.g. 伴奏, 现场版,
+    1080p); empty when the filename has no third segment.
+    """
+    stem = Path(name).stem
+    parts = stem.split("-", 2)
+    if len(parts) < 3:
+        return ""
+    return parts[2].strip()
+
+
 def file_size(path: str) -> int | None:
     """st_size in bytes, or None if the file is missing/unreadable."""
     try:

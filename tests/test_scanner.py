@@ -16,6 +16,7 @@ from ezkaraoke.scanner import (
     SizeBackfillWorker,
     file_size,
     parse_filename,
+    parse_version,
     scan_folder,
 )
 
@@ -62,6 +63,26 @@ def test_parse_strips_extension():
 
 def test_parse_no_extension():
     assert parse_filename("A-B") == ("A", "B")
+
+
+# -------------------------------------------------------------- parse_version
+def test_version_third_segment():
+    assert parse_version("周杰伦-晴天-伴奏.mp4") == "伴奏"
+    assert parse_version("陈奕迅-浮夸-现场版.mkv") == "现场版"
+
+
+def test_version_missing_third_segment():
+    assert parse_version("周杰伦-晴天.mp4") == ""
+    assert parse_version("晴天.mp4") == ""
+
+
+def test_version_keeps_extra_segments():
+    assert parse_version("a-b-c-d.mp4") == "c-d"
+
+
+def test_version_strips_extension_and_spaces():
+    assert parse_version("A-B- 官方MV .mp4") == "官方MV"
+    assert parse_version("A-B") == ""
 
 
 # --------------------------------------------------------------- VIDEO_EXTS

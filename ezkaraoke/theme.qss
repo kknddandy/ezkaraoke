@@ -177,13 +177,14 @@ QHeaderView::section {
     font-size: 13px;
 }
 
-/* Main song table: double-size display font (14px -> 28px) */
+/* Main song table: display font, 15% smaller than the original 28px so the
+   extra 版本 column fits comfortably (Qt rounds 23.8px to 24px). */
 QTableView#SongTable {
-    font-size: 28px;
+    font-size: 24px;
 }
 
 QTableView#SongTable::item {
-    padding: 10px 14px;
+    padding: 8px 10px;
 }
 
 QTableView#SongTable QHeaderView::section {

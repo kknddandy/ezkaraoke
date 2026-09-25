@@ -17,6 +17,7 @@ from PySide6.QtCore import QObject, Signal, QTimer
 
 from ezkaraoke import pitchshift
 from ezkaraoke.library import Song
+from ezkaraoke.loudness import compute_gain
 
 _NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启"
 
@@ -139,6 +140,10 @@ class PlayerController(QObject):
         self._epoch = 0  # identity of the currently loaded media; any in-flight EndReached from an earlier media is stale
         self._ev_end = None  # stash of vlc.EventType.MediaPlayerEndReached
         self._media_ended.connect(self._on_media_ended)
+        # Loudness alignment (docs/loudness-normalization-spec.md §7)
+        self._db = None
+        self._loudness_enabled = True
+        self._loudness_target = -11.25
 
     # ------------------------------------------------------------------ state
     @property
@@ -329,6 +334,7 @@ class PlayerController(QObject):
             self._player.play()
             self._active_path = path
             QTimer.singleShot(0, lambda: self._sync_audio_track(0))
+            self._apply_loudness_gain()
             # VLC resets rate/pitch per new media; reapply the preferred pitch.
             self._apply_pitch()
             if needs_shift:
@@ -721,6 +727,7 @@ class PlayerController(QObject):
         except Exception:  # noqa: BLE001
             return
         self._audio_track_index = new_index
+        self._apply_loudness_gain()
         self.audio_track_changed.emit(new_index)
         self.status_message.emit("已切换为伴奏" if new_index else "已切换为原唱")
 
@@ -729,7 +736,12 @@ class PlayerController(QObject):
 
         Track info may not be parsed yet right after set_media, so retry a
         few times. Emits audio_track_changed with the settled index.
+
+        Re-applies loudness on every entry (including retries): libvlc may
+        rebuild the audio output asynchronously after set_media and drop the
+        EQ, which would otherwise leave a flat-EQ window at song start.
         """
+        self._apply_loudness_gain()
         player = self._player
         if player is None or self._current_index < 0:
             return
@@ -738,6 +750,7 @@ class PlayerController(QObject):
             if attempt < 10:
                 QTimer.singleShot(200, lambda: self._sync_audio_track(attempt + 1))
             else:
+                self._apply_loudness_gain()
                 self.audio_track_changed.emit(self._audio_track_index)
             return
         preferred = self._audio_track_index if len(ids) >= 2 else 0
@@ -758,7 +771,70 @@ class PlayerController(QObject):
                     return
                 preferred = 0
         self._audio_track_index = preferred
+        self._apply_loudness_gain()
         self.audio_track_changed.emit(preferred)
+
+    # ------------------------------------------------------------- loudness
+    def attach_database(self, db) -> None:
+        """Loudness source; None disables loudness alignment silently."""
+        self._db = db
+
+    @property
+    def loudness_enabled(self) -> bool:
+        return self._loudness_enabled
+
+    @property
+    def loudness_target(self) -> float:
+        return self._loudness_target
+
+    def set_loudness_enabled(self, enabled: bool) -> None:
+        self._loudness_enabled = bool(enabled)
+        self._apply_loudness_gain()  # immediate; off -> preamp 0
+
+    def set_loudness_target(self, target: float) -> None:
+        self._loudness_target = float(target)
+        self._apply_loudness_gain()
+
+    def _loudness_rows_for_active(self):
+        """Rows for the active path, falling back to the current song's path
+        (pitch-shift cache variants have no own measurement)."""
+        if self._db is None or self._current_index < 0:
+            return []
+        song = self._queue[self._current_index]
+        for path in (self._active_path, song.path):
+            if path:
+                try:
+                    rows = self._db.get_loudness(path)
+                except Exception:  # noqa: BLE001 - loudness must not break playback
+                    rows = []
+                if rows:
+                    return rows
+        return []
+
+    def _apply_loudness_gain(self) -> None:
+        """Align the active track to the target loudness via EQ preamp.
+
+        No libvlc / no DB / nothing measured -> preamp 0. Never raises:
+        loudness alignment must not break playback.
+        """
+        player = self._player
+        if player is None:
+            return
+        gain = 0.0
+        if self._loudness_enabled:
+            rows = self._loudness_rows_for_active()
+            if rows:
+                row = rows[min(max(self._audio_track_index, 0), len(rows) - 1)]
+                if row.lufs is not None:
+                    gain = compute_gain(row.lufs, row.peak_db, self._loudness_target)
+        try:
+            import vlc
+
+            eq = vlc.AudioEqualizer()
+            eq.set_preamp(gain)
+            player.audio_set_equalizer(eq)
+        except Exception:  # noqa: BLE001 - loudness must never break playback
+            pass
 
     # ------------------------------------------------------------------ pitch
     def set_pitch(self, semitones: int) -> None:
@@ -887,6 +963,7 @@ class PlayerController(QObject):
             if position > 0:
                 player.set_time(position)
             self._active_path = path
+            self._apply_loudness_gain()
             QTimer.singleShot(0, lambda: self._sync_audio_track(0))
         except Exception as e:  # noqa: BLE001 - keep the old media playing
             self.status_message.emit(str(e))

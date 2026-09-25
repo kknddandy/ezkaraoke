@@ -15,6 +15,7 @@ import time
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from ezkaraoke.database import LoudnessRow, SongDatabase
 from ezkaraoke.library import Song
 from ezkaraoke.player import PlayerController
 
@@ -51,6 +52,7 @@ class FakePlayer:
         self.rates: list[float] = []
         self.length = length
         self.position = position
+        self.equalizers: list = []
         # stand-in for python-vlc's _Ctype ctypes protocol attribute
         self._as_parameter_ = object()
 
@@ -85,6 +87,10 @@ class FakePlayer:
             self.current = i_track
             return 0
         return -1
+
+    def audio_set_equalizer(self, eq) -> int:
+        self.equalizers.append(eq)
+        return 0
 
     def get_length(self) -> int:
         return self.length
@@ -1277,3 +1283,145 @@ def test_new_media_disables_hardware_decoding(qapp):
     media = p._new_media("/music/a.mp4")
     assert media.path == "/music/a.mp4"
     assert ":avcodec-hw=none" in media.options
+
+
+# ------------------------------------------------------------------ loudness
+class _FakeEq:
+    """Stand-in for vlc.AudioEqualizer capturing set_preamp."""
+
+    def set_preamp(self, db: float) -> None:
+        self.preamp = float(db)
+
+
+@pytest.fixture
+def loudness(qapp, tmp_path, monkeypatch):
+    """PlayerController wired to a real SongDatabase plus a fake
+    vlc.AudioEqualizer. Returns (controller, db, eqs) where *eqs* collects
+    every fake equalizer handed to the player. The module-level ``import
+    vlc`` inside _apply_loudness_gain resolves the real module, so patching
+    its AudioEqualizer attribute is sufficient."""
+    vlc = pytest.importorskip("vlc")  # libvlc is installed on this machine
+    eqs: list[_FakeEq] = []
+
+    def fake_eq() -> _FakeEq:
+        eq = _FakeEq()
+        eqs.append(eq)
+        return eq
+
+    monkeypatch.setattr(vlc, "AudioEqualizer", fake_eq)
+
+    db = SongDatabase(tmp_path / "lib.db")
+    p = PlayerController()
+    p._player = FakePlayer(2)
+    p._db = db
+    song = make("A", "t")
+    p._queue = [song]
+    p._current_index = 0
+    p._active_path = song.path
+    return p, db, eqs
+
+
+def _row(path: str, lufs: float, peak_db: float | None,
+         track_pos: int = 0) -> LoudnessRow:
+    return LoudnessRow(
+        path=path, track_pos=track_pos, lufs=lufs, peak_db=peak_db,
+        duration=None, size=None, mtime=None, ok=True, measured_at=0.0,
+    )
+
+
+def test_loudness_gain_applied(loudness):
+    p, db, eqs = loudness
+    assert p.loudness_enabled is True
+    assert p.loudness_target == pytest.approx(-11.25)
+    db.put_loudness([_row(p._queue[0].path, -20.0, None)])
+    p._apply_loudness_gain()
+    assert len(eqs) == 1
+    assert eqs[0].preamp == pytest.approx(8.75)  # -11.25 - (-20.0)
+
+
+def test_loudness_clipping_guard_attenuates(loudness):
+    # True peak already above the -1.0 dB ceiling: only attenuation allowed,
+    # gain = min(8.75, -1.0 - 2.7) = -3.7
+    p, db, eqs = loudness
+    db.put_loudness([_row(p._queue[0].path, -20.0, 2.7)])
+    p._apply_loudness_gain()
+    assert eqs[0].preamp == pytest.approx(-3.7)
+
+
+def test_loudness_disabled_zeroes_preamp(loudness):
+    p, db, eqs = loudness
+    db.put_loudness([_row(p._queue[0].path, -20.0, None)])
+    p.set_loudness_enabled(False)  # immediate; off -> preamp 0
+    assert p.loudness_enabled is False
+    assert eqs[0].preamp == pytest.approx(0.0)
+
+
+def test_loudness_no_db_zeroes_preamp(loudness):
+    p, db, eqs = loudness
+    db.put_loudness([_row(p._queue[0].path, -20.0, None)])
+    p.attach_database(None)  # None disables loudness alignment silently
+    p._apply_loudness_gain()
+    assert eqs[0].preamp == pytest.approx(0.0)
+
+
+def test_loudness_variant_falls_back_to_source_path(loudness):
+    # A pitch-shift cache variant is a different path with no measurement of
+    # its own: the row of the original song must be used instead.
+    p, db, eqs = loudness
+    src = p._queue[0].path
+    p._active_path = "/cache/shifted-variant.mp4"  # no row for this path
+    db.put_loudness([_row(src, -20.0, None)])
+    p._apply_loudness_gain()
+    assert eqs[0].preamp == pytest.approx(8.75)  # fallback row applied
+
+
+def test_toggle_audio_track_reapplies_gain(loudness):
+    # Switching tracks must hand the player a NEW equalizer carrying the
+    # preamp of the newly active track's row (not the previous track's).
+    p, db, eqs = loudness
+    path = p._queue[0].path
+    db.put_loudness([
+        _row(path, -20.0, None, track_pos=0),
+        _row(path, -10.0, None, track_pos=1),
+    ])
+    p._apply_loudness_gain()  # index 0 -> row 0
+    assert p.audio_track_index == 0
+    assert eqs[-1].preamp == pytest.approx(8.75)  # -11.25 - (-20.0)
+    before = len(eqs)
+    p.toggle_audio_track()
+    assert p.audio_track_index == 1
+    assert len(eqs) > before  # a fresh equalizer was set on the toggle
+    assert eqs[-1].preamp == pytest.approx(-1.25)  # -11.25 - (-10.0), row 1
+
+
+def test_sync_audio_track_applies_on_retry_exhaust(loudness, monkeypatch):
+    # libvlc reports no tracks yet and every retry exhausts: the final
+    # (exhaustion) attempt must still apply the loudness gain, closing the
+    # flat-EQ window at song start.
+    from PySide6.QtCore import QTimer
+
+    class NoTrackPlayer(FakePlayer):
+        def audio_get_track_description(self) -> list[tuple[int, bytes]]:
+            return []
+
+    p, db, eqs = loudness
+    p._player = NoTrackPlayer(2)
+    db.put_loudness([_row(p._queue[0].path, -20.0, None)])
+
+    def single_shot(ms: int, fn, *args, **kwargs) -> None:
+        fn()  # run the 200 ms retry immediately
+
+    monkeypatch.setattr(QTimer, "singleShot", single_shot)
+    p._sync_audio_track(9)  # attempt 9 schedules 10, which runs and exhausts
+    assert len(eqs) >= 1
+    assert eqs[-1].preamp == pytest.approx(8.75)  # exhaustion apply happened
+
+
+def test_loudness_row_lookup_clamps_track_index(loudness):
+    # Only a row for track_pos 0 exists while the preferred index is 5:
+    # the lookup must clamp to row 0 (no IndexError, preamp = row 0 gain).
+    p, db, eqs = loudness
+    db.put_loudness([_row(p._queue[0].path, -20.0, None)])
+    p._audio_track_index = 5
+    p._apply_loudness_gain()
+    assert eqs[-1].preamp == pytest.approx(8.75)  # row 0's gain

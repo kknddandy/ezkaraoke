@@ -25,6 +25,7 @@ _EN: dict[str, str] = {
     "重新扫描": "Rescan",
     "搜索歌手或歌名…": "Search artist or title…",
     "歌名": "Title",
+    "版本": "Version",
     "文件尺寸": "Size",
     "序号": "#",
     "点歌": "Queue",
@@ -89,7 +90,6 @@ _EN: dict[str, str] = {
     "生成{pct}%": "Generating {pct}%",
     "该歌曲没有可切换的音轨": "This song has no switchable audio tracks",
     "未在播放": "Not playing",
-    "停止": "Stopped",
     "播放中": "Playing",
     "已暂停": "Paused",
     "全屏": "Fullscreen",
@@ -103,6 +103,19 @@ _EN: dict[str, str] = {
         "background, about 1 minute)"
     ),
     "缺少 ffmpeg：变调同时改变速度": "ffmpeg missing: pitch shift also changes tempo",
+    # ---- loudness normalization
+    "响度对齐": "Loudness",
+    "正在测量响度": "Measuring loudness",
+    "开始测量": "Start measuring",
+    "停止测量": "Stop measuring",
+    "停止": "Stopped",
+    "重新测量全部": "Re-measure all",
+    "启用": "Enable",
+    "停用": "Disable",
+    "目标响度": "Target loudness",
+    "已测 {ok} / {total}（失败 {failed}）": "Measured {ok}/{total} ({failed} failed)",
+    "目标 {target} LUFS": "Target {target} LUFS",
+    "确定重新测量全部歌曲的响度吗？": "Re-measure loudness for all songs?",
     # ---- status messages (emitted as raw keys by PlayerController)
     "未检测到 VLC 运行库，请安装 VLC 后重启": (
         "VLC runtime not detected. Install VLC and restart"
@@ -112,6 +125,7 @@ _EN: dict[str, str] = {
     "变调生成失败（ffmpeg），保持原曲播放": (
         "Pitch shift generation failed (ffmpeg); keeping the original"
     ),
+    "未找到 ffmpeg，无法测量响度": "ffmpeg not found; cannot measure loudness",
 }
 
 _language: str = DEFAULT_LANGUAGE

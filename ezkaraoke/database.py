@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from ezkaraoke import paths
@@ -33,11 +35,39 @@ CREATE TABLE IF NOT EXISTS artists (
 CREATE TABLE IF NOT EXISTS favorites (
     path TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS loudness (
+    path         TEXT    NOT NULL,
+    track_pos    INTEGER NOT NULL DEFAULT 0,
+    lufs         REAL,
+    peak_db      REAL,
+    duration     REAL,
+    size         INTEGER,
+    mtime        REAL,
+    ok           INTEGER NOT NULL DEFAULT 1,
+    measured_at  REAL    NOT NULL,
+    tool         TEXT    NOT NULL DEFAULT 'ebur128',
+    PRIMARY KEY (path, track_pos)
+);
+CREATE INDEX IF NOT EXISTS idx_loudness_path ON loudness(path);
 """
 
 
 def _row_to_song(row: tuple) -> Song:
     return Song(artist=row[0], title=row[1], path=row[2], size=row[3])
+
+
+@dataclass(frozen=True)
+class LoudnessRow:
+    path: str
+    track_pos: int          # 0-based audio-track ordinal (NOT ffprobe stream index)
+    lufs: float | None
+    peak_db: float | None
+    duration: float | None
+    size: int | None
+    mtime: float | None
+    ok: bool
+    measured_at: float
+    tool: str = "ebur128"
 
 
 class SongDatabase:
@@ -87,12 +117,16 @@ class SongDatabase:
             self._conn.execute(
                 "DELETE FROM favorites WHERE path NOT IN (SELECT path FROM songs)"
             )
+            self._conn.execute(
+                "DELETE FROM loudness WHERE path NOT IN (SELECT path FROM songs)"
+            )
 
     def delete_song(self, path: str) -> None:
         """Remove one song; artists left without songs are dropped too."""
         with self._conn:
             self._conn.execute("DELETE FROM songs WHERE path = ?", (str(path),))
             self._conn.execute("DELETE FROM favorites WHERE path = ?", (str(path),))
+            self._conn.execute("DELETE FROM loudness WHERE path = ?", (str(path),))
             self._conn.execute(
                 "DELETE FROM artists WHERE name NOT IN "
                 "(SELECT DISTINCT artist FROM songs)"
@@ -241,6 +275,129 @@ class SongDatabase:
             (cutoff,),
         ).fetchall()
         return [r[0] for r in rows]
+
+    def get_loudness(self, path: str) -> list[LoudnessRow]:
+        """Loudness rows for a path, ordered by track_pos ascending."""
+        rows = self._conn.execute(
+            "SELECT path, track_pos, lufs, peak_db, duration, size, mtime, ok, "
+            "measured_at, tool FROM loudness WHERE path = ? ORDER BY track_pos",
+            (str(path),),
+        ).fetchall()
+        return [
+            LoudnessRow(
+                path=r[0],
+                track_pos=r[1],
+                lufs=r[2],
+                peak_db=r[3],
+                duration=r[4],
+                size=r[5],
+                mtime=r[6],
+                ok=bool(r[7]),
+                measured_at=r[8],
+                tool=r[9],
+            )
+            for r in rows
+        ]
+
+    def put_loudness(self, rows: list[LoudnessRow]) -> None:
+        """Insert or replace loudness rows in one executemany."""
+        if not rows:
+            return
+        self._conn.executemany(
+            "INSERT OR REPLACE INTO loudness VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    r.path,
+                    r.track_pos,
+                    r.lufs,
+                    r.peak_db,
+                    r.duration,
+                    r.size,
+                    r.mtime,
+                    int(r.ok),
+                    r.measured_at,
+                    r.tool,
+                )
+                for r in rows
+            ],
+        )
+        self._conn.commit()
+
+    def mark_loudness_failed(self, path: str, track_pos: int) -> None:
+        """Record a measurement failure so it is not retried every run.
+
+        Stores the current size/mtime snapshot so the row counts as
+        attempted for this file version; a missing file stores NULLs.
+        """
+        try:
+            st = os.stat(path)
+            size: int | None = st.st_size
+            mtime: float | None = st.st_mtime
+        except OSError:
+            size = None
+            mtime = None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO loudness "
+            "(path, track_pos, lufs, peak_db, duration, size, mtime, ok, "
+            "measured_at, tool) VALUES (?, ?, NULL, NULL, NULL, ?, ?, 0, ?, ?)",
+            (str(path), track_pos, size, mtime, time.time(), "ebur128"),
+        )
+        self._conn.commit()
+
+    def loudness_pending(self) -> list[tuple[str, int]]:
+        """(path, size) of songs without a loudness row for their current size.
+
+        DB-only: a stored row matching the song's size snapshot means the
+        file version was already attempted (including deliberate failures);
+        a size change makes the song pending again.
+        """
+        rows = self._conn.execute(
+            "SELECT s.path, s.size FROM songs s "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM loudness l WHERE l.path = s.path "
+            "AND (s.size IS NULL OR l.size = s.size)"
+            ") ORDER BY s.path"
+        ).fetchall()
+        return [(path, size) for path, size in rows]
+
+    def loudness_stats(self) -> dict:
+        """count/ok/failed plus min/median/max lufs over ok rows."""
+        count, ok, failed = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(ok), 0), "
+            "COALESCE(SUM(1 - ok), 0) FROM loudness"
+        ).fetchone()
+        values = [
+            r[0]
+            for r in self._conn.execute(
+                "SELECT lufs FROM loudness "
+                "WHERE ok = 1 AND lufs IS NOT NULL ORDER BY lufs"
+            ).fetchall()
+        ]
+        median: float | None = None
+        if values:
+            n = len(values)
+            mid = n // 2
+            median = (values[mid - 1] + values[mid]) / 2 if n % 2 == 0 else values[mid]
+        return {
+            "count": count,
+            "ok": ok,
+            "failed": failed,
+            "min": values[0] if values else None,
+            "median": median,
+            "max": values[-1] if values else None,
+        }
+
+    def clear_loudness(self) -> None:
+        self._conn.execute("DELETE FROM loudness")
+        self._conn.commit()
+
+    def prune_loudness(self) -> int:
+        """Drop rows for paths no longer in songs; returns the deleted count."""
+        cursor = self._conn.execute(
+            "DELETE FROM loudness WHERE path NOT IN (SELECT path FROM songs)"
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def close(self) -> None:
         self._conn.close()

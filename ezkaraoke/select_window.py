@@ -20,6 +20,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -49,9 +51,10 @@ from ezkaraoke.database import SongDatabase
 from ezkaraoke.i18n import on_language_changed, off_language_changed, tr
 from ezkaraoke.letters import pinyin_key
 from ezkaraoke.library import Song
+from ezkaraoke.loudness import LoudnessWorker
 from ezkaraoke.player import PlayerController
 from ezkaraoke.pitchshift import remove_cached_for
-from ezkaraoke.scanner import ScanWorker, SizeBackfillWorker
+from ezkaraoke.scanner import ScanWorker, SizeBackfillWorker, parse_version
 from ezkaraoke.web_server import WebServer, qr_pixmap
 
 
@@ -102,7 +105,7 @@ class _SongTableModel(QAbstractTableModel):
     edge (see the construction site).
     """
 
-    COLUMNS = 4  # 歌手 / 歌名 / 文件尺寸 / spacer
+    COLUMNS = 5  # 歌手 / 歌名 / 版本 / 文件尺寸 / spacer
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -127,8 +130,10 @@ class _SongTableModel(QAbstractTableModel):
                 return song.artist
             if col == 1:
                 return song.title
+            if col == 2:
+                return parse_version(song.path)
             return format_size(song.size)
-        if role == Qt.TextAlignmentRole and col == 2:
+        if role == Qt.TextAlignmentRole and col == 3:
             return int(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
@@ -138,7 +143,7 @@ class _SongTableModel(QAbstractTableModel):
 
     def headerData(self, section: int, orientation, role: int = Qt.DisplayRole):
         if orientation == Qt.Horizontal and role == Qt.DisplayRole:
-            return (tr("歌手"), tr("歌名"), tr("文件尺寸"), "")[section]
+            return (tr("歌手"), tr("歌名"), tr("版本"), tr("文件尺寸"), "")[section]
         return None
 
     def retranslate(self) -> None:
@@ -157,10 +162,17 @@ class _SongTableModel(QAbstractTableModel):
         """Reorder rows in place (display-role keys, pinyin-aware)."""
         if not self._songs:
             return
-        if column == 2:
+        if column == 3:
             # Size (bytes) primary, missing sizes last; artist as tie-break.
             key = lambda s: (  # noqa: E731
                 (s.size if s.size is not None else -1),
+                pinyin_key(s.artist) + [s.artist],
+                s.artist,
+            )
+        elif column == 2:
+            # Version label; artist/title as tie-break.
+            key = lambda s: (  # noqa: E731
+                parse_version(s.path),
                 pinyin_key(s.artist) + [s.artist],
                 s.artist,
             )
@@ -274,10 +286,23 @@ class SelectWindow(QMainWindow):
         self._controller = controller
         self._db = db
         self._config = config
+        # Loudness: the player must not open the DB itself; hand it over and
+        # start the playback gain in sync with the persisted config.
+        self._controller.attach_database(self._db)
+        self._controller.set_loudness_enabled(self._config.loudness_enabled)
+        self._controller.set_loudness_target(self._config.loudness_target)
         self._scan_worker: ScanWorker | None = None
         self._avatar_worker: AvatarWorker | None = None
         self._avatar_renderer: AvatarRenderer | None = None
         self._size_worker: SizeBackfillWorker | None = None
+        self._loudness_worker: LoudnessWorker | None = None
+        self._loudness_dialog: QDialog | None = None
+        # The panel's widgets are closure-local; the window-level
+        # finished/error slots refresh it through these callbacks, which are
+        # set while the dialog is open and cleared when it closes.
+        self._loudness_refresh_status = None
+        self._loudness_update_buttons = None
+        self._loudness_update_toggle_text = None
         # A rescan must not start while a size backfill is writing to the
         # songs table (SQLite lock contention); instead of blocking the GUI
         # thread on the backfill, a short timer starts the scan as soon as
@@ -375,6 +400,11 @@ class SelectWindow(QMainWindow):
         self._btn_rescan.clicked.connect(self._start_scan)
         toolbar_layout.addWidget(self._btn_rescan)
 
+        self._btn_loudness = QPushButton(tr("响度对齐"), self)
+        self._btn_loudness.setObjectName("ToolButton")
+        self._btn_loudness.clicked.connect(self._open_loudness_panel)
+        toolbar_layout.addWidget(self._btn_loudness)
+
         self._btn_lang = QPushButton(self)
         self._btn_lang.setObjectName("ToolButton")
         self._btn_lang.setToolTip("Switch UI language / 切换界面语言")
@@ -407,10 +437,12 @@ class SelectWindow(QMainWindow):
         header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.Interactive)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-        self._song_table.setColumnWidth(0, 240)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.Fixed)
+        self._song_table.setColumnWidth(0, 160)
         self._song_table.setColumnWidth(2, 120)
-        self._song_table.setColumnWidth(3, 20)
+        self._song_table.setColumnWidth(3, 115)
+        self._song_table.setColumnWidth(4, 20)
         # Comfortable breathing room around the 28px display font
         self._song_table.verticalHeader().setDefaultSectionSize(52)
         # Manual pinyin-aware sorting: Qt's built-in sort compares raw
@@ -616,6 +648,7 @@ class SelectWindow(QMainWindow):
         self._btn_mode_letter.setText(tr("首字母"))
         self._btn_choose.setText(tr("选择文件夹…"))
         self._btn_rescan.setText(tr("重新扫描"))
+        self._btn_loudness.setText(tr("响度对齐"))
         self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
         self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
         self._song_model.retranslate()
@@ -763,6 +796,190 @@ class SelectWindow(QMainWindow):
     def _on_size_backfill_done(self) -> None:
         self._size_worker = None
         self._refresh_song_table()
+
+    # ===== Loudness =====
+
+    def _loudness_status_text(self) -> str:
+        stats = self._db.loudness_stats()
+        return "\n".join(
+            (
+                tr(
+                    "已测 {ok} / {total}（失败 {failed}）",
+                    ok=stats["ok"],
+                    total=stats["count"],
+                    failed=stats["failed"],
+                ),
+                tr("目标 {target} LUFS", target=f"{self._config.loudness_target:g}"),
+            )
+        )
+
+    def _open_loudness_panel(self) -> None:
+        # Re-open the existing panel instead of stacking another dialog
+        # on top of it.
+        if self._loudness_dialog is not None:
+            self._loudness_dialog.raise_()
+            self._loudness_dialog.activateWindow()
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("响度对齐"))
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(8)
+
+        status = QLabel(dlg)
+        status.setText(self._loudness_status_text())
+        status.setWordWrap(True)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel(tr("目标响度"), dlg))
+        target_spin = QDoubleSpinBox(dlg)
+        target_spin.setRange(-30, -5)
+        target_spin.setSingleStep(0.25)
+        target_spin.setValue(self._config.loudness_target)
+        target_row.addWidget(target_spin)
+        target_row.addStretch()
+
+        start_btn = QPushButton(tr("开始测量"), dlg)
+        start_btn.setObjectName("AccentButton")
+        stop_btn = QPushButton(tr("停止测量"), dlg)
+        stop_btn.setObjectName("ToolButton")
+        remeasure_btn = QPushButton(tr("重新测量全部"), dlg)
+        remeasure_btn.setObjectName("ToolButton")
+        toggle_btn = QPushButton(dlg)
+        toggle_btn.setObjectName("ToolButton")
+
+        btn_row = QHBoxLayout()
+        for btn in (start_btn, stop_btn, remeasure_btn, toggle_btn):
+            btn_row.addWidget(btn)
+        btn_row.addStretch()
+
+        layout.addWidget(status)
+        layout.addLayout(target_row)
+        layout.addLayout(btn_row)
+
+        def _refresh_status() -> None:
+            status.setText(self._loudness_status_text())
+
+        def _update_toggle_text() -> None:
+            toggle_btn.setText(
+                tr("停用") if self._controller.loudness_enabled else tr("启用")
+            )
+
+        def _update_buttons() -> None:
+            running = self._loudness_worker is not None
+            start_btn.setEnabled(not running)
+            remeasure_btn.setEnabled(not running)
+            stop_btn.setEnabled(running)
+
+        def _on_progress(done: int, total: int) -> None:
+            if total > 0:
+                self._set_progress_count(tr("正在测量响度"), done, total)
+            else:
+                self._set_progress_busy(tr("正在测量响度"))
+
+        def _start_worker() -> None:
+            if (
+                self._loudness_worker is not None
+                and self._loudness_worker.isRunning()
+            ):
+                return
+            worker = LoudnessWorker(
+                str(self._db.path),
+                workers=self._config.loudness_workers,
+                target=self._config.loudness_target,
+            )
+            self._loudness_worker = worker
+            # Bind the worker identity into the slots: a stale worker's
+            # queued finished/error must not clear a newer worker's
+            # reference (that would leave the new one untracked and
+            # unstoppable on close).
+            worker.progress.connect(_on_progress)
+            worker.finished.connect(
+                lambda w=worker: self._on_loudness_finished(w)
+            )
+            worker.error.connect(
+                lambda message, w=worker: self._on_loudness_error(w, message)
+            )
+            worker.start()
+            self._set_progress_busy(tr("正在测量响度"))
+            _update_buttons()
+
+        def _stop_worker() -> None:
+            if self._loudness_worker is not None:
+                self._loudness_worker.stop()
+
+        def _remeasure_all() -> None:
+            reply = QMessageBox.question(
+                self,
+                tr("重新测量全部"),
+                tr("确定重新测量全部歌曲的响度吗？"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._db.clear_loudness()
+                _refresh_status()
+                _start_worker()
+
+        def _toggle_enabled() -> None:
+            enabled = not self._controller.loudness_enabled
+            self._controller.set_loudness_enabled(enabled)
+            self._config.loudness_enabled = enabled
+            save_config(self._config)
+            _update_toggle_text()
+
+        def _target_changed(value: float) -> None:
+            self._controller.set_loudness_target(value)
+            self._config.loudness_target = float(value)
+            save_config(self._config)
+            _refresh_status()
+
+        start_btn.clicked.connect(_start_worker)
+        stop_btn.clicked.connect(_stop_worker)
+        remeasure_btn.clicked.connect(_remeasure_all)
+        toggle_btn.clicked.connect(_toggle_enabled)
+        target_spin.valueChanged.connect(_target_changed)
+
+        _update_toggle_text()
+        _update_buttons()
+
+        self._loudness_refresh_status = _refresh_status
+        self._loudness_update_buttons = _update_buttons
+        self._loudness_update_toggle_text = _update_toggle_text
+
+        self._loudness_dialog = dlg
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+
+        def _on_dialog_finished(_result: int) -> None:
+            self._loudness_dialog = None
+            self._loudness_refresh_status = None
+            self._loudness_update_buttons = None
+            self._loudness_update_toggle_text = None
+
+        dlg.finished.connect(_on_dialog_finished)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_loudness_finished(self, worker) -> None:
+        """A loudness run finished; ignore signals from stale workers."""
+        if self._loudness_worker is not worker:
+            return
+        self._loudness_worker = None
+        self._set_progress_idle()
+        if self._loudness_dialog is not None:
+            self._loudness_refresh_status()
+            self._loudness_update_buttons()
+            self._loudness_update_toggle_text()
+
+    def _on_loudness_error(self, worker, message: str) -> None:
+        """A loudness run failed; only the tracked worker resets the UI."""
+        self._on_status_message(message)
+        if self._loudness_worker is worker and not worker.isRunning():
+            self._loudness_worker = None
+            self._set_progress_idle()
+            if self._loudness_dialog is not None:
+                self._loudness_update_buttons()
+                self._loudness_update_toggle_text()
 
     # ===== Mode / lists =====
 
@@ -1253,6 +1470,11 @@ class SelectWindow(QMainWindow):
         ):
             if worker is not None:
                 worker.stop()
+        # The loudness worker spawns ffmpeg children: stop it and wait for
+        # the thread to exit so no ffmpeg survives the window close.
+        if self._loudness_worker is not None:
+            self._loudness_worker.stop()
+            self._loudness_worker.wait(5000)
         self._scan_defer_timer.stop()
         self._web.stop()
         off_language_changed(self.retranslate)

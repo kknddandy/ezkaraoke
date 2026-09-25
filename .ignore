@@ -1,0 +1,3 @@
+# allow reading deepwork state even though .gitignore excludes it
+!.slim/deepwork/
+!.slim/deepwork/**

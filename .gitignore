@@ -17,3 +17,6 @@ venv/
 
 # Local tool state
 .opencode/
+
+# Deepwork session state
+.slim/deepwork/

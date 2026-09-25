@@ -54,6 +54,9 @@ def test_tr_english_table():
     assert i18n.tr("点歌") == "Queue"
     assert i18n.tr("共 {count} 首", count=3) == "3 songs"
     assert i18n.tr("升{semis}", semis=2) == "+2"
+    # Playback STATE label (player window) vs the loudness stop button key.
+    assert i18n.tr("停止") == "Stopped"
+    assert i18n.tr("停止测量") == "Stop measuring"
     # Unknown key (song data) passes through untouched.
     assert i18n.tr("晴天") == "晴天"
     # Key with an unfilled placeholder passes through untouched.
@@ -139,7 +142,8 @@ def test_select_window_retranslate(qapp, tmp_path, monkeypatch):
         assert win.windowTitle() == "ezkaraoke · Song Selector"
         assert win._btn_append.text() == "Queue"
         assert win._song_model.headerData(0, Qt.Horizontal) == "Artist"
-        assert win._song_model.headerData(2, Qt.Horizontal) == "Size"
+        assert win._song_model.headerData(2, Qt.Horizontal) == "Version"
+        assert win._song_model.headerData(3, Qt.Horizontal) == "Size"
         assert win._artist_list.item(0).text() == "All (3)"
         assert win._btn_lang.text() == "中文"
 

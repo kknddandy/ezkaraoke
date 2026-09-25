@@ -219,21 +219,35 @@ def test_avatar_fetched_persists_and_marks_tried(win):
     assert win._db.get_avatar("邓紫棋") is None
 
 
-def test_table_has_size_column_no_filename(win):
-    # 3 real columns + a trailing spacer that keeps the size column's
+def test_table_has_version_and_size_columns(win):
+    # 4 real columns + a trailing spacer that keeps the size column's
     # resize handle off the splitter at the table's right edge.
     model = win._song_model
-    assert model.columnCount() == 4
+    assert model.columnCount() == 5
     assert model.headerData(0, Qt.Horizontal) == "歌手"
     assert model.headerData(1, Qt.Horizontal) == "歌名"
-    assert model.headerData(2, Qt.Horizontal) == "文件尺寸"
-    assert model.headerData(3, Qt.Horizontal) == ""
+    assert model.headerData(2, Qt.Horizontal) == "版本"
+    assert model.headerData(3, Qt.Horizontal) == "文件尺寸"
+    assert model.headerData(4, Qt.Horizontal) == ""
     header = win._song_table.horizontalHeader()
-    assert header.sectionResizeMode(2) == QHeaderView.Interactive
-    assert header.sectionResizeMode(3) == QHeaderView.Fixed
+    assert header.sectionResizeMode(3) == QHeaderView.Interactive
+    assert header.sectionResizeMode(4) == QHeaderView.Fixed
     # sorting is manual (pinyin-aware); Qt's built-in sort is not used
     assert not win._song_table.isSortingEnabled()
     assert not win._song_table.horizontalHeader().isSortIndicatorShown()
+
+
+def test_version_column_shows_parsed_filename(win):
+    # 版本 comes from the third "-"-separated filename segment.
+    win._song_model.set_songs([
+        Song("周杰伦", "晴天", "/music/周杰伦-晴天-伴奏.mp4"),
+        Song("周杰伦", "晴天", "/music/周杰伦-晴天-官方MV.mp4"),
+        Song("周杰伦", "晴天", "/music/周杰伦-晴天.mp4"),
+    ])
+    model = win._song_model
+    assert model.data(model.index(0, 2), Qt.DisplayRole) == "伴奏"
+    assert model.data(model.index(1, 2), Qt.DisplayRole) == "官方MV"
+    assert model.data(model.index(2, 2), Qt.DisplayRole) == ""
 
 
 def test_format_size():
@@ -252,9 +266,9 @@ def test_size_column_shows_and_sorts_numerically(win):
     win._db.rebuild(sized)
     win._refresh_song_table()
     model = win._song_model
-    assert model.data(model.index(0, 2)) != "—"
+    assert model.data(model.index(0, 3)) != "—"
 
-    win._on_header_clicked(2)  # ascending by byte count
+    win._on_header_clicked(3)  # ascending by byte count
     sizes = [s.size for s in table_rows(win)]
     assert sizes == sorted(sizes)
     assert sizes[0] == 1024 * 1024

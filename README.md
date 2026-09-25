@@ -168,6 +168,46 @@ The config holds the music folder, language and phone-ordering web port.
 If the app reports that VLC is missing, install VLC for your platform
 (see [Requirements](#requirements)) and restart.
 
+## Loudness normalization
+
+Songs in a home library come from different eras and masters, so their
+loudness varies widely. On the reference library (15,237 files /
+1.1 TB) the measured integrated loudness has a median of **−11.25 LUFS**
+but spans **−31.2 to −7.6 LUFS** (a ~24 dB spread): some songs are
+deafening, others nearly inaudible, and users had to ride the volume
+slider between songs.
+
+ezkaraoke evens this out **without ever modifying the media files**:
+
+- **One-off background measurement.** Every audio track of every song is
+  measured once with `ffmpeg ... -vn -af ebur128=peak=true` (audio only —
+  no video decoding). Results are cached in the SQLite library
+  (`loudness` table, keyed by path + track position, with a size/mtime
+  snapshot so replaced files are re-measured automatically). Strictly
+  read-only: media files are never touched.
+- **Static playback gain.** During playback a single static gain is
+  applied via `AudioEqualizer.set_preamp` (libvlc 3.x, ±20 dB, pure
+  gain — no tonal change), bringing the track toward a configurable
+  target loudness (default −11.25 LUFS). The volume slider remains
+  exclusively yours.
+- **Toggleable** for A/B comparison — turning it off restores the
+  original, unadjusted behaviour.
+
+CLI (no GUI required; handy for measuring a full library on a dev
+machine first):
+
+```bash
+python -m ezkaraoke.loudness --scan /mnt/NAS/Karaoke --workers 8
+python -m ezkaraoke.loudness --stats        # statistics only, no measuring
+```
+
+Config: `loudness_enabled` (default on), `loudness_target` (−30 to
+−5 LUFS, default −11.25), `loudness_workers` (0 to 16; 0 = auto,
+cpu/2; default 8).
+
+Measurement averages ≈ 98× real time with `-vn`; the full 15,237-file /
+1.1 TB library takes ≈ 1.7 h with 8 parallel workers (warm NAS cache).
+
 ## Project layout
 
 ```
@@ -201,6 +241,34 @@ pytest -q
 
 The UI tests run with `QT_QPA_PLATFORM=offscreen` (set automatically in
 `tests/conftest.py`), so no display is required.
+
+## Known limitations
+
+Loudness normalization is deliberately simple — a static gain applied at
+playback time, no re-encoding. Its trade-offs:
+
+1. **Boosts above +12 dB amplify the noise floor.** Some old tape
+   sources (e.g. the −31 LUFS ones) become audibly hissy when brought
+   up. The boost is therefore capped at +12 dB, and it is preferred to
+   under-boost a song than to amplify its noise.
+2. **Per-song internal dynamics are not addressed.** Static gain
+   equalises songs against each other, not the level swings within a
+   song (the library contains tracks with a loudness range up to
+   19.8 LU). Fixing that would require dynamic compression, which
+   damages music.
+3. **Only effective inside ezkaraoke.** The gain is applied by this
+   player at playback time; other players see the original loudness.
+   This is the core trade-off of not re-encoding (zero risk, takes
+   effect immediately, can be reversed at any time).
+4. **Measurements can go stale.** Cached values are invalidated only by
+   the size/mtime snapshot: a replacement file with the same size and
+   mtime reuses the old value. Known and accepted.
+5. **VLC 4 upgrade note.** The ±20 dB range is the libvlc 3.x preamp
+   convention (tested on VLC 3.0.23). When upgrading to libvlc 4,
+   re-verify the preamp bounds and update the clamp constants.
+6. **NAS bandwidth during measurement.** 8 parallel measurements
+   saturate a gigabit NAS link; if you are singing while the library is
+   being measured, lower `loudness_workers` (e.g. 2–3).
 
 ## License
 
@@ -360,6 +428,40 @@ ezkaraoke
 
 若提示缺少 VLC，请按 [环境要求](#环境要求) 安装对应平台的 VLC 后重启。
 
+## 响度对齐
+
+曲库里的歌曲来自不同年代、不同母带，响度参差不齐。参考曲库
+（15,237 个文件 / 1.1 TB）实测：集成响度中位数 **−11.25 LUFS**，
+全距达 **−31.2 ~ −7.6 LUFS**（约 24 dB 跨度）——有的歌震耳、有的
+几乎听不见，用户必须手动推音量滑杆跟着调。
+
+ezkaraoke 在**绝不修改媒体文件**的前提下解决该问题：
+
+- **一次性后台测量**：对每个文件的每条音轨各测量一次，命令为
+  `ffmpeg ... -vn -af ebur128=peak=true`（只解音频，不解视频）。
+  结果缓存进 SQLite（`loudness` 表，以路径 + 音轨序号为主键，并记录
+  测量时的大小/mtime 快照；文件被替换后会自动重测）。严格只读，
+  从不写入媒体文件。
+- **播放时静态增益**：播放时通过 `AudioEqualizer.set_preamp` 施加单一
+  静态增益（libvlc 3.x，±20 dB，纯增益、不改变音色），把当前音轨
+  对齐到可配置的目标响度（默认 −11.25 LUFS）。音量滑杆仍由用户
+  独占。
+- **可随时开关**，便于 A/B 对比；关闭后行为与改造前完全一致。
+
+CLI（不依赖 GUI，适合先在开发机上跑全库）：
+
+```bash
+python -m ezkaraoke.loudness --scan /mnt/NAS/Karaoke --workers 8
+python -m ezkaraoke.loudness --stats        # 只打印统计，不测量
+```
+
+配置项：`loudness_enabled`（默认开启）、`loudness_target`
+（−30 ~ −5 LUFS，默认 −11.25）、`loudness_workers`（0 ~ 16；
+0 = 自动取 cpu/2，默认 8）。
+
+`-vn` 下测量速度平均约 98× 实时；15,237 个文件 / 1.1 TB 的曲库
+8 并行约 1.7 小时（NAS 热缓存）。
+
 ## 项目结构
 
 ```
@@ -393,6 +495,28 @@ pytest -q
 
 UI 测试通过 `QT_QPA_PLATFORM=offscreen` 运行（`tests/conftest.py` 已
 自动设置），无需显示器。
+
+## 已知限制
+
+响度对齐刻意保持简单——静态增益、播放时施加、不重编码——相应有
+以下取舍：
+
+1. **提升超过 +12 dB 会把底噪一起放大**：库里有 −31 LUFS 的老录像带
+   源，这类文件对齐后"响度够了但嘶声明显"。因此提升上限为 +12 dB，
+   超出部分不补——宁可偏小，不要变脏。
+2. **单曲内部的动态范围不对齐**：静态增益只能对齐"歌曲之间"，无法
+   对齐"一首歌内部"的起伏（库内 LRA 最高 19.8 LU）。要解决需要动态
+   压缩，会破坏音乐，本方案不做。
+3. **只在 ezkaraoke 内生效**：增益在播放时由本播放器施加，其他播放器
+   播放同一文件仍是原始响度。这是"不改文件"的核心权衡（零风险、
+   秒级生效、可随时反悔）。
+4. **旧测量值可能被复用**：缓存以 size/mtime 快照判定失效；若替换
+   文件的大小与 mtime 都保持不变，将沿用旧值——已知且可接受。
+5. **VLC 4 升级注意**：±20 dB 是 libvlc 3.x 的 preamp 约定（本项目
+   在 VLC 3.0.23 上实测）。升级到 libvlc 4 时需重新确认 preamp 边界
+   并更新夹取常量。
+6. **NAS 带宽**：8 并行测量会占满千兆网口；测量期间若同时在唱，
+   建议把 `loudness_workers` 调低到 2~3。
 
 ## 许可证
 

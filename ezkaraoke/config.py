@@ -17,6 +17,9 @@ class Config:
     db_path: str = ""
     language: str = "zh"
     web_port: int = 8848
+    loudness_enabled: bool = True
+    loudness_target: float = -11.25      # allowed -30 .. -5
+    loudness_workers: int = 8            # allowed 0 .. 16; 0 = auto (cpu/2)
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
@@ -43,11 +46,33 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> Config:
         or not 1 <= web_port <= 65535
     ):
         web_port = 8848
+    loudness_enabled = data.get("loudness_enabled", True)
+    if not isinstance(loudness_enabled, bool):
+        loudness_enabled = True
+    loudness_target = data.get("loudness_target", -11.25)
+    if (
+        isinstance(loudness_target, bool)
+        or not isinstance(loudness_target, (int, float))
+        or not -30 <= loudness_target <= -5
+    ):
+        loudness_target = -11.25
+    else:
+        loudness_target = float(loudness_target)
+    loudness_workers = data.get("loudness_workers", 8)
+    if (
+        not isinstance(loudness_workers, int)
+        or isinstance(loudness_workers, bool)
+        or not 0 <= loudness_workers <= 16
+    ):
+        loudness_workers = 8
     return Config(
         music_folder=music_folder,
         db_path=db_path,
         language=language,
         web_port=web_port,
+        loudness_enabled=loudness_enabled,
+        loudness_target=loudness_target,
+        loudness_workers=loudness_workers,
     )
 
 

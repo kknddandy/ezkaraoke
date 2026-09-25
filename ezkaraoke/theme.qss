@@ -135,7 +135,10 @@ QLineEdit::placeholder {
 }
 
 /* ===== Table Widget ===== */
-QTableWidget {
+/* QTableView (not just QTableWidget): the song results list is a model-based
+   QTableView#SongTable. Targeting only QTableWidget left its alternate rows
+   on the light default palette, making every other row's text invisible. */
+QTableView {
     background-color: #0c0c14;
     alternate-background-color: #11111c;
     border: 1px solid #1e1e2f;
@@ -146,21 +149,21 @@ QTableWidget {
     outline: none;
 }
 
-QTableWidget::item {
+QTableView::item {
     padding: 6px 10px;
     border-bottom: 1px solid #1a1a28;
 }
 
-QTableWidget::item:selected {
+QTableView::item:selected {
     background-color: rgba(232, 160, 48, 0.25);
     color: #ececec;
 }
 
-QTableWidget::item:hover {
+QTableView::item:hover {
     background-color: rgba(232, 160, 48, 0.12);
 }
 
-QTableWidget::item:selected:hover {
+QTableView::item:selected:hover {
     background-color: rgba(232, 160, 48, 0.35);
 }
 
@@ -175,15 +178,15 @@ QHeaderView::section {
 }
 
 /* Main song table: double-size display font (14px -> 28px) */
-QTableWidget#SongTable {
+QTableView#SongTable {
     font-size: 28px;
 }
 
-QTableWidget#SongTable::item {
+QTableView#SongTable::item {
     padding: 10px 14px;
 }
 
-QTableWidget#SongTable QHeaderView::section {
+QTableView#SongTable QHeaderView::section {
     font-size: 18px;
     padding: 10px 12px;
 }

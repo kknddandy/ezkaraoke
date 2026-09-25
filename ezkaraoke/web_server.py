@@ -65,11 +65,14 @@ def _song_payload(song: Song) -> dict:
     return {"artist": song.artist, "title": song.title, "path": song.path}
 
 
-def _state_payload(controller: PlayerController) -> dict:
+def _state_payload(controller: PlayerController, db: SongDatabase) -> dict:
     queue = controller.queue
     current_index = controller.current_index
     current = (
-        _song_payload(queue[current_index])
+        {
+            **_song_payload(queue[current_index]),
+            "favorite": db.is_favorite(queue[current_index].path),
+        }
         if 0 <= current_index < len(queue)
         else None
     )
@@ -77,7 +80,18 @@ def _state_payload(controller: PlayerController) -> dict:
         "state": controller.state,
         "current_index": current_index,
         "current": current,
-        "queue": [{"index": i, **_song_payload(song)} for i, song in enumerate(queue)],
+        "queue": [
+            {
+                "index": i,
+                **_song_payload(song),
+                "favorite": db.is_favorite(song.path),
+            }
+            for i, song in enumerate(queue)
+        ],
+        "track": {
+            "multi": controller.has_multi_audio_track(),
+            "index": controller.audio_track_index,
+        },
     }
 
 
@@ -180,10 +194,15 @@ class WebServer(QObject):
 
     def _dispatch(self, action: str, payload: dict) -> dict:
         if action == "state":
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "search":
             songs = self._db.search(str(payload.get("q", "")))[:SEARCH_LIMIT]
-            return {"results": [_song_payload(s) for s in songs]}
+            return {
+                "results": [
+                    {**_song_payload(s), "favorite": self._db.is_favorite(s.path)}
+                    for s in songs
+                ]
+            }
         if action == "add":
             song = self._db.get_song(str(payload.get("path", "")))
             if song is None:
@@ -192,22 +211,22 @@ class WebServer(QObject):
             self._controller.append(song)
             if was_empty and self._controller.queue:
                 self._controller.play_at(0)
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "play_now":
             song = self._db.get_song(str(payload.get("path", "")))
             if song is None:
                 return {"error": "song not found"}
             self._controller.play_now(song)
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "remove":
             self._controller.remove_at(_as_index(payload))
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "move":
             self._controller.move(_as_index(payload), int(payload.get("delta", 0) or 0))
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "clear":
             self._controller.clear_queue()
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
         if action == "transport":
             name = str(payload.get("name", ""))
             handler = {
@@ -219,7 +238,20 @@ class WebServer(QObject):
             if handler is None:
                 return {"error": "unknown transport action"}
             handler()
-            return _state_payload(self._controller)
+            return _state_payload(self._controller, self._db)
+        if action == "favorite":
+            path = str(payload.get("path", ""))
+            song = self._db.get_song(path)
+            if song is None:
+                return {"error": "song not found"}
+            self._db.toggle_favorite(path)
+            return _state_payload(self._controller, self._db)
+        if action == "track":
+            name = str(payload.get("name", ""))
+            if name != "toggle":
+                return {"error": "unknown track action"}
+            self._controller.toggle_audio_track()
+            return _state_payload(self._controller, self._db)
         return {"error": "unknown action"}
 
 
@@ -300,8 +332,9 @@ html,body { margin:0; padding:0; }
 body { background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; font-size:16px; padding-bottom:calc(76px + env(safe-area-inset-bottom)); }
 header { position:sticky; top:0; background:var(--bg); padding:12px 16px 8px; z-index:2; }
 h1 { font-size:18px; margin:0 0 4px; }
-#now { font-size:13px; color:var(--dim); min-height:18px; }
+#now { display:flex; align-items:center; gap:8px; font-size:13px; color:var(--dim); min-height:18px; }
 #now b { color:var(--accent); font-weight:600; }
+#nowtxt { flex:1; min-width:0; }
 main { padding:0 12px; max-width:640px; margin:0 auto; }
 section { background:var(--card); border-radius:12px; padding:12px; margin-bottom:12px; }
 h2 { font-size:13px; color:var(--dim); margin:0 0 8px; font-weight:600; }
@@ -323,6 +356,9 @@ button { min-height:44px; }
 .op { flex:0 0 auto; background:#2a2a3e; color:var(--fg); border:none; border-radius:8px; width:36px; height:36px; font-size:16px; line-height:1; padding:0; }
 .op.danger { color:var(--danger); }
 .op:disabled { opacity:.35; }
+.op.track { width:auto; min-width:44px; height:44px; padding:0 12px; font-size:13px; }
+.op.fav { min-width:44px; height:44px; color:var(--dim); font-size:18px; }
+.op.fav.on { color:var(--danger); }
 .empty { color:var(--dim); font-size:14px; text-align:center; padding:12px 0; }
 nav { position:fixed; bottom:0; left:0; right:0; background:#151520; border-top:1px solid #2a2a3e; display:flex; justify-content:space-around; padding:8px 8px calc(8px + env(safe-area-inset-bottom)); z-index:3; }
 nav button { flex:1; margin:0 4px; background:#2a2a3e; color:var(--fg); border:none; border-radius:10px; padding:10px 0; font-size:14px; }
@@ -335,7 +371,7 @@ nav button.warn { color:var(--danger); }
 <body>
 <header>
   <h1>EzKaraoke · 手机点歌</h1>
-  <div id="now">未在播放</div>
+  <div id="now"><span id="nowtxt">未在播放</span><button id="b-track" class="op track" hidden>切伴奏</button></div>
 </header>
 <main>
   <section>
@@ -374,13 +410,17 @@ function toast(msg) {
 
 function render(state) {
   if (!state) return;
-  const now = $("now");
+  const now = $("nowtxt");
   if (state.current) {
     const mark = state.state === "playing" ? "▶" : state.state === "paused" ? "⏸" : "";
     now.innerHTML = mark + " 正在播放：<b>" + esc(state.current.title) + "</b> · " + esc(state.current.artist);
   } else {
     now.textContent = "未在播放";
   }
+  const tb = $("b-track");
+  const multi = !!(state.track && state.track.multi);
+  tb.hidden = !multi;
+  if (multi) tb.textContent = state.track.index === 1 ? "切原唱" : "切伴奏";
   $("b-toggle").textContent = state.state === "playing" ? "⏸ 暂停" : "▶ 播放";
 
   const ul = $("queue"); ul.innerHTML = "";
@@ -392,16 +432,17 @@ function render(state) {
       '<span class="idx">' + (s.index === state.current_index ? "▶" : s.index + 1) + "</span>" +
       '<span class="name"><div class="t">' + esc(s.title) + '</div><div class="a">' + esc(s.artist) + "</div></span>";
     const ops = [
-      ["up", "↑", s.index === 0, () => post({action:"move", index:s.index, delta:-1})],
-      ["down", "↓", s.index === n - 1, () => post({action:"move", index:s.index, delta:1})],
-      ["del", "✕", false, () => {
+      ["", "↑", s.index === 0, () => post({action:"move", index:s.index, delta:-1})],
+      ["", "↓", s.index === n - 1, () => post({action:"move", index:s.index, delta:1})],
+      ["danger", "✕", false, () => {
         if (s.index === state.current_index && !confirm("删除正在播放的歌曲？")) return;
         return post({action:"remove", index:s.index});
       }],
+      [s.favorite ? "fav on" : "fav", s.favorite ? "♥" : "♡", false, () => post({action:"favorite", path:s.path})],
     ];
-    for (const [, label, disabled, fn] of ops) {
+    for (const [cls, label, disabled, fn] of ops) {
       const b = document.createElement("button");
-      b.className = "op" + (label === "✕" ? " danger" : "");
+      b.className = "op" + (cls ? " " + cls : "");
       b.textContent = label; b.disabled = !!disabled;
       b.onclick = async () => { await fn(); refresh(); };
       li.appendChild(b);
@@ -428,6 +469,15 @@ async function runSearch() {
   for (const s of (d.results || []).slice(0, 30)) {
     const li = document.createElement("li");
     li.innerHTML = '<span class="name"><div class="t">' + esc(s.title) + '</div><div class="a">' + esc(s.artist) + "</div></span>";
+    const fav = document.createElement("button");
+    fav.className = "op fav" + (s.favorite ? " on" : "");
+    fav.textContent = s.favorite ? "♥" : "♡";
+    fav.onclick = async () => {
+      await post({action:"favorite", path:s.path});
+      await runSearch();
+      refresh();
+    };
+    li.appendChild(fav);
     const b = document.createElement("button");
     b.className = "addbtn"; b.textContent = "＋ 点歌";
     b.onclick = async () => {
@@ -442,6 +492,7 @@ async function runSearch() {
   ul.style.display = (d.results || []).length ? "block" : "none";
 }
 
+$("b-track").onclick = async () => { await post({action:"track", name:"toggle"}); refresh(); };
 $("b-prev").onclick = async () => { await post({action:"transport", name:"prev"}); refresh(); };
 $("b-next").onclick = async () => { await post({action:"transport", name:"next"}); refresh(); };
 $("b-toggle").onclick = async () => { await post({action:"transport", name:"toggle"}); refresh(); };

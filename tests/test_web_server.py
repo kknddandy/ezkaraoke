@@ -141,7 +141,9 @@ def test_state_empty(server, qapp):
         "current_index": -1,
         "current": None,
         "queue": [],
+        "track": {"multi": False, "index": 0},
     }
+    assert body["track"]["multi"] is False
 
 
 def test_search_by_artist(server, qapp):
@@ -314,6 +316,108 @@ def test_unknown_action_is_400(server, qapp):
     status, body = post_action(qapp, base_of(server), "explode")
     assert status == 400
     assert "error" in body
+
+
+# ------------------------------------------------------------------ favorite
+def test_favorite_toggles(server, qapp):
+    base = base_of(server)
+    status, body = post_action(qapp, base, "favorite", path=QINGTIAN)
+    assert status == 200
+    assert "error" not in body
+    assert server._db.is_favorite(QINGTIAN) is True
+    status, body = post_action(qapp, base, "favorite", path=QINGTIAN)
+    assert status == 200
+    assert server._db.is_favorite(QINGTIAN) is False
+
+
+def test_favorite_unknown_path_is_400(server, qapp):
+    status, body = post_action(qapp, base_of(server), "favorite", path="/music/不存在.mp4")
+    assert status == 400
+    assert "error" in body
+
+
+def test_state_reflects_favorite_on_queue_and_current(server, qapp):
+    base = base_of(server)
+    post_action(qapp, base, "add", path=QINGTIAN)
+    status, body = post_action(qapp, base, "favorite", path=QINGTIAN)
+    assert status == 200
+    assert body["queue"][0]["favorite"] is True
+    status, st = get_json(qapp, base, "/api/state")
+    assert status == 200
+    assert st["queue"][0]["favorite"] is True
+    assert st["current"]["favorite"] is True
+
+
+def test_search_results_carry_favorite(server, qapp):
+    base = base_of(server)
+    q = "/api/search?q=" + urllib.parse.quote("晴天")
+    status, body = get_json(qapp, base, q)
+    assert status == 200
+    assert [s["path"] for s in body["results"]] == [QINGTIAN]
+    assert all(isinstance(s["favorite"], bool) for s in body["results"])
+    assert body["results"][0]["favorite"] is False
+    post_action(qapp, base, "favorite", path=QINGTIAN)
+    status, body = get_json(qapp, base, q)
+    assert status == 200
+    assert body["results"][0]["favorite"] is True
+
+
+# --------------------------------------------------------------------- track
+def test_track_default_state_is_single(server, qapp):
+    status, body = get_json(qapp, base_of(server), "/api/state")
+    assert status == 200
+    assert body["track"]["multi"] is False
+    assert body["track"]["index"] == 0
+
+
+def test_track_unknown_name_is_400(server, qapp):
+    status, body = post_action(qapp, base_of(server), "track", name="bogus")
+    assert status == 400
+    assert "error" in body
+
+
+class _FakePlayer:
+    """Minimal stand-in for the libvlc media player (audio track API only)."""
+
+    def __init__(self):
+        self._current = 1
+        self.set_calls: list[int] = []
+
+    def audio_get_track_description(self):
+        return [(-1, b"Disable"), (1, b"A"), (2, b"B")]
+
+    def audio_get_track(self):
+        return self._current
+
+    def audio_set_track(self, i):
+        self.set_calls.append(i)
+        self._current = i
+        return 0
+
+
+def test_track_toggle_with_stub_player(server, qapp):
+    base = base_of(server)
+    fake = _FakePlayer()
+    server._controller._player = fake
+    try:
+        status, st = get_json(qapp, base, "/api/state")
+        assert status == 200
+        assert st["track"]["multi"] is True
+        assert st["track"]["index"] == 0
+
+        status, st = post_action(qapp, base, "track", name="toggle")
+        assert status == 200
+        assert st["track"]["multi"] is True
+        assert st["track"]["index"] == 1
+        assert fake.set_calls == [2]  # real track id of index 1
+
+        status, st = post_action(qapp, base, "track", name="toggle")
+        assert status == 200
+        assert st["track"]["multi"] is True
+        assert st["track"]["index"] == 0
+        assert fake.set_calls == [2, 1]
+    finally:
+        server._controller._player = None
 
 
 # -------------------------------------------------------------------- errors

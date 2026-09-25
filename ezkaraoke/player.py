@@ -20,6 +20,12 @@ from ezkaraoke.library import Song
 
 _NO_VLC_MESSAGE = "未检测到 VLC 运行库，请安装 VLC 后重启"
 
+# Software h264 decoding. VLC 3.0.x's VA-API path on Wayland/i965 can exhaust
+# its surface pool and spam "get_buffer() failed / thread_get_buffer() failed /
+# no frame!", and in the worst case freeze the picture (videolan/vlc#25701).
+# Karaoke video is low-resolution, so software decode is a cheap, stable fix.
+_MEDIA_OPTIONS = (":avcodec-hw=none",)
+
 
 def _vlc_library_names() -> tuple[str, ...]:
     """Candidate libvlc shared-library names for the current platform."""
@@ -111,7 +117,7 @@ class PlayerController(QObject):
     pitch_changed = Signal(int)        # semitones, 0 = 原调
     pitch_status = Signal(str)         # "" idle | "shifting" generating variant
     pitch_progress = Signal(float)     # 0.0 .. 1.0 while shifting
-    _media_ended = Signal()            # internal: EndReached (libvlc thread) -> main thread
+    _media_ended = Signal(int)         # internal: EndReached (libvlc thread) -> main thread (epoch)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -126,11 +132,12 @@ class PlayerController(QObject):
         self._current_media = None
         self._vlc_available: bool | None = None  # None = not yet attempted
         self._warned_no_vlc = False
-        self._advancing = False  # re-entrancy guard for EndReached handling
+        self._advancing = False  # main-thread re-entrancy flag for EndReached handling
         self._audio_track_index = 0  # preferred track, persists across songs
         self._shift_worker: _PitchShiftWorker | None = None
         self._active_path: str | None = None  # file currently loaded in VLC
-        self._ended_token = None  # identity of the media whose EndReached arrived
+        self._epoch = 0  # identity of the currently loaded media; any in-flight EndReached from an earlier media is stale
+        self._ev_end = None  # stash of vlc.EventType.MediaPlayerEndReached
         self._media_ended.connect(self._on_media_ended)
 
     # ------------------------------------------------------------------ state
@@ -200,12 +207,9 @@ class PlayerController(QObject):
         except Exception:  # noqa: BLE001 - detection is best-effort
             self._pitch_fn = None
         try:
-            event_manager = self._player.event_manager()
-            # Note: no trailing positional argument — python-vlc forwards
-            # every extra arg to the callback, which only takes (event).
-            event_manager.event_attach(
-                vlc.EventType.MediaPlayerEndReached, self._on_media_end
-            )
+            # Stash the event type only; EndReached is (re)attached per
+            # media load in _attach_end_events with the epoch bound in.
+            self._ev_end = vlc.EventType.MediaPlayerEndReached
         except Exception:
             pass
         return True
@@ -215,35 +219,99 @@ class PlayerController(QObject):
             self._warned_no_vlc = True
             self.status_message.emit(_NO_VLC_MESSAGE)
 
-    def _on_media_end(self, event) -> None:
+    def _attach_end_events(self) -> None:
+        """(Re)register EndReached bound to the current media epoch.
+
+        libvlc allows only one callback per event type, so detach the old
+        registration first. The epoch is bound as an event argument, so the
+        libvlc-thread handler never reads mutable controller state: an event
+        belonging to an already-replaced media can never be mistaken for the
+        current one.
+        """
+        player = self._player
+        if player is None or self._ev_end is None:
+            return
+        try:
+            em = player.event_manager()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            em.event_detach(self._ev_end)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            em.event_attach(self._ev_end, self._on_media_end, self._epoch)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_media_end(self, event, epoch: int) -> None:
         """libvlc EndReached handler — runs on the libvlc event thread.
 
-        Must not call libvlc (stop / set_media / play) or touch Qt here:
-        the event fires while the input thread is still finishing the
-        media, and a player call made inside the callback deadlocks
-        against it — at the end of the queue the whole app freezes
-        ("Python 停止响应"). Record which media ended and post to the
-        Qt main thread instead.
+        Forwards only; `epoch` was bound at attach/load time. Must not call
+        libvlc (stop/set_media/play) or touch Qt here: the event fires while
+        the input thread is still finishing the media and a player call from
+        this callback deadlocks against it. Post to the Qt main thread.
         """
-        if self._advancing:
-            return
-        self._ended_token = (id(self._current_media), self._active_path)
-        self._media_ended.emit()
+        self._media_ended.emit(epoch)
 
-    def _on_media_ended(self) -> None:
+    def _on_media_ended(self, epoch: int) -> None:
         """Main-thread half of EndReached: advance the queue.
 
-        Skipped when the user already moved on (next / stop / removed
-        the current song): the loaded media is no longer the one that
-        just ended, so the queued event is stale.
+        Ignored when the event belongs to a media that has already been
+        replaced (epoch mismatch), when playback was stopped/paused away, or
+        when the current media has not actually played to its end.
         """
-        if self._ended_token != (id(self._current_media), self._active_path):
+        if epoch != self._epoch:
+            return
+        if self._state not in ("playing", "paused"):
+            return
+        if not self._reached_end():
             return
         self._advancing = True
         try:
             self.next()
         finally:
             self._advancing = False
+
+    def _reached_end(self) -> bool:
+        """True when the current media plausibly played to its end.
+
+        Guards against libvlc emitting EndReached spuriously (decoder / video
+        output teardown, hwaccel failure) while the song is still part-way.
+        Unknown duration or position counts as reached, so genuine ends still
+        advance and streams are never stalled.
+
+        Tolerance: libvlc's reported position at a genuine EndReached can sit
+        slightly behind the nominal length (the software video path reports
+        ~891ms for a 1000ms clip), so accept anything within the last 2s or
+        5% of the duration (whichever is larger). A spurious end tens of
+        seconds into a multi-minute song is still rejected.
+        """
+        if self._player is None:
+            return True
+        try:
+            length = self._player.get_length()
+        except Exception:  # noqa: BLE001
+            return True
+        if length <= 0:
+            return True
+        try:
+            t = self._player.get_time()
+        except Exception:  # noqa: BLE001
+            return True
+        if t < 0:
+            return True
+        return t >= length - max(2000, length * 0.05)
+
+    def _new_media(self, path: str):
+        """Create a libvlc Media with the project's decode options applied."""
+        media = self._vlc.media_new(path)
+        for option in _MEDIA_OPTIONS:
+            try:
+                media.add_option(option)
+            except Exception:  # noqa: BLE001 - options are best-effort
+                pass
+        return media
 
     def _start_vlc(self) -> None:
         """Start actual playback of the current song. No-op without libvlc."""
@@ -255,8 +323,9 @@ class PlayerController(QObject):
         path, needs_shift = self._resolve_play_path(song.path)
         try:
             self._player.stop()
-            self._current_media = self._vlc.media_new(path)
+            self._current_media = self._new_media(path)
             self._player.set_media(self._current_media)
+            self._attach_end_events()
             self._player.play()
             self._active_path = path
             QTimer.singleShot(0, lambda: self._sync_audio_track(0))
@@ -286,6 +355,7 @@ class PlayerController(QObject):
             except Exception:  # noqa: BLE001
                 pass
         self._current_media = None
+        self._active_path = None
 
     def _set_state(self, state: str) -> None:
         if state != self._state:
@@ -294,6 +364,7 @@ class PlayerController(QObject):
 
     def _begin_play(self, index: int) -> None:
         """Bookkeeping + playback start for *index* (a valid queue index)."""
+        self._epoch += 1
         self._current_index = index
         self.current_changed.emit(index)
         self._set_state("playing")
@@ -588,7 +659,7 @@ class PlayerController(QObject):
 
     def stop(self) -> None:
         """Stop playback; the queue is kept, current_index becomes -1."""
-        self._ended_token = None  # a pending end event must not resume
+        self._epoch += 1  # invalidate any in-flight end event
         self._stop_vlc()
         if self._current_index != -1:
             self._current_index = -1
@@ -808,8 +879,10 @@ class PlayerController(QObject):
             position = -1
         try:
             player.stop()
-            self._current_media = self._vlc.media_new(path)
+            self._epoch += 1
+            self._current_media = self._new_media(path)
             player.set_media(self._current_media)
+            self._attach_end_events()
             player.play()
             if position > 0:
                 player.set_time(position)

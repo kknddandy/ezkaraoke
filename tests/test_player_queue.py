@@ -44,11 +44,13 @@ class FakePlayer:
     (a two-track file reports IDs 1 and 2, and track_count() is 3).
     """
 
-    def __init__(self, count: int = 0) -> None:
+    def __init__(self, count: int = 0, length: int = -1, position: int = -1) -> None:
         self.count = count
         self.set_calls: list[int] = []
         self.current: int = 1 if count else -1
         self.rates: list[float] = []
+        self.length = length
+        self.position = position
         # stand-in for python-vlc's _Ctype ctypes protocol attribute
         self._as_parameter_ = object()
 
@@ -83,6 +85,25 @@ class FakePlayer:
             self.current = i_track
             return 0
         return -1
+
+    def get_length(self) -> int:
+        return self.length
+
+    def get_time(self) -> int:
+        return self.position
+
+    def event_manager(self) -> "_FakeEventManager":
+        return _FakeEventManager()
+
+
+class _FakeEventManager:
+    """No-op stand-in for the libvlc event manager (attach/detach)."""
+
+    def event_attach(self, *args, **kwargs) -> None:
+        pass
+
+    def event_detach(self, *args, **kwargs) -> None:
+        pass
 
 
 def paths(queue: list[Song]) -> list[str]:
@@ -720,17 +741,15 @@ def test_state_changed_emissions(qapp):
 
 # --------------------------------------------------------------- media end
 def test_media_end_advances_to_next(qapp):
-    # python-vlc invokes the EndReached handler as callback(event) —
-    # exactly one argument. Regression: a stray extra argument used to be
-    # attached, raising TypeError inside the handler and breaking
-    # auto-advance.
+    # python-vlc invokes the EndReached handler as callback(event, *args);
+    # the epoch is bound at attach time and forwarded verbatim.
     p = PlayerController()
     s1, s2 = make("A", "a1"), make("B", "b1")
     p.append(s1)
     p.append(s2)
     p.play_at(0)
     assert p.current_index == 0
-    p._on_media_end(object())  # must not raise
+    p._on_media_end(object(), p._epoch)  # must not raise
     assert p.current_index == 1
     assert p.is_playing
     p.stop()
@@ -740,7 +759,7 @@ def test_media_end_at_last_song_stops(qapp):
     p = PlayerController()
     p.append(make("A", "a1"))
     p.play_at(0)
-    p._on_media_end(object())  # last song ended -> stop, no raise
+    p._on_media_end(object(), p._epoch)  # last song ended -> stop, no raise
     assert p.current_index == -1
     assert not p.is_playing
 
@@ -748,7 +767,7 @@ def test_media_end_at_last_song_stops(qapp):
 def test_media_end_from_libvlc_thread_advances_on_main_thread(qapp):
     """EndReached arrives on a libvlc worker thread.
 
-    The callback must only record + emit; the actual advance (which calls
+    The callback must only forward + emit; the actual advance (which calls
     libvlc) is delivered as a queued signal on the main thread. Before the
     fix the callback called libvlc in place and deadlocked at the end of
     the queue, freezing the whole app ("Python 停止响应").
@@ -762,7 +781,7 @@ def test_media_end_from_libvlc_thread_advances_on_main_thread(qapp):
     assert p.current_index == 0
 
     def fire():
-        p._on_media_end(object())  # what python-vlc invokes on its thread
+        p._on_media_end(object(), p._epoch)  # what python-vlc invokes on its thread
 
     t = threading.Thread(target=fire)
     t.start()
@@ -778,20 +797,18 @@ def test_media_end_from_libvlc_thread_advances_on_main_thread(qapp):
 
 def test_media_end_slot_ignores_stale_token(qapp):
     """A queued EndReached that is processed after the user already moved
-    on must not advance a second time."""
+    on must not advance a second time: its bound epoch no longer matches
+    the epoch of the currently loaded media."""
     p = PlayerController()
-    p.append(make("A", "a1"))
-    p.append(make("B", "b1"))
+    for i in range(3):
+        p.append(make("A", f"a{i}"))
     p.play_at(0)
-    gen1, gen2 = object(), object()
-    p._current_media, p._active_path = gen1, "/gen1"
-    p._ended_token = (id(gen1), "/gen1")  # end event for gen1 pending
-    p._current_media, p._active_path = gen2, "/gen2"  # user moved on
-    p._on_media_ended()
-    assert p.current_index == 0  # stale event ignored
-    p._ended_token = (id(gen2), "/gen2")  # matching event still advances
-    p._on_media_ended()
-    assert p.current_index == 1
+    old = p._epoch  # end event pending for the media loaded at index 0
+    p.next()  # user moved on: the newly loaded media has a newer epoch
+    p._on_media_ended(old)
+    assert p.current_index == 1  # stale event ignored
+    p._on_media_ended(p._epoch)  # matching event still advances
+    assert p.current_index == 2
     p.stop()
 
 
@@ -799,10 +816,57 @@ def test_media_end_after_stop_does_not_resume(qapp):
     p = PlayerController()
     p.append(make("A", "a1"))
     p.play_at(0)
+    old = p._epoch  # captured before stop invalidates it
     p.stop()
-    p._on_media_ended()  # a late end event for the stopped player
+    p._on_media_ended(old)  # a late end event for the stopped player
     assert p.current_index == -1
     assert not p.is_playing
+
+
+def test_late_end_event_after_next_is_ignored(qapp):
+    """The original bug: EndReached carries no media identity, so an
+    in-flight end event delivered after the user pressed next used to
+    fire next() a second time (skipping a song). The epoch bound at load
+    time catches it."""
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    p.play_at(0)
+    old = p._epoch
+    p.next()  # index 1, newer epoch
+    p._on_media_ended(old)  # stale end for the song at index 0
+    assert p.current_index == 1  # not advanced again
+    p.stop()
+
+
+def test_end_ignored_when_media_not_finished(qapp):
+    # A spurious EndReached (decoder / video output teardown) mid-song
+    # must not skip: the position is far from the end.
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    p._begin_play(0)  # bookkeeping only (no libvlc on this machine)
+    p._player = FakePlayer(length=100000, position=1000)
+    assert p.current_index == 0
+    p._on_media_ended(p._epoch)
+    assert p.current_index == 0  # only 1s in of 100s: no advance
+    assert p.is_playing
+    p.stop()
+
+
+def test_end_advances_when_media_finished(qapp):
+    # A genuine end: position within 1s of (and past 90% of) the duration
+    # advances.
+    p = PlayerController()
+    p.append(make("A", "a1"))
+    p.append(make("B", "b1"))
+    p._begin_play(0)
+    p._player = FakePlayer(length=100000, position=99000)
+    assert p.current_index == 0
+    p._on_media_ended(p._epoch)
+    assert p.current_index == 1
+    assert p.is_playing
+    p.stop()
 
 
 def test_playlist_drains_to_stopped_without_freezing(qapp, tmp_path):
@@ -1189,3 +1253,27 @@ def test_shift_finished_ignored_when_song_moved_on(qapp, monkeypatch, tmp_path):
     p._active_path = src
     p._on_shift_finished(src, 2)  # late callback for the old song
     assert vlc.media_paths[-1] == "/music/B-u.mp4"  # no swap happened
+
+
+def test_new_media_disables_hardware_decoding(qapp):
+    """h264 software decode: VLC's VA-API surface pool on Wayland/i965
+    exhausts and spams get_buffer() failures (and can freeze video), so
+    every media we build must carry :avcodec-hw=none."""
+
+    class FakeMedia:
+        def __init__(self, path: str) -> None:
+            self.path = path
+            self.options: list[str] = []
+
+        def add_option(self, option: str) -> None:
+            self.options.append(option)
+
+    class FakeVlc:
+        def media_new(self, path: str) -> "FakeMedia":
+            return FakeMedia(path)
+
+    p = PlayerController()
+    p._vlc = FakeVlc()
+    media = p._new_media("/music/a.mp4")
+    assert media.path == "/music/a.mp4"
+    assert ":avcodec-hw=none" in media.options

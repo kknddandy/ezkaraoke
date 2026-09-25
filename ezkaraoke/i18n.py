@@ -21,6 +21,8 @@ _EN: dict[str, str] = {
     # ---- select window
     "歌手": "Artist",
     "首字母": "First Letter",
+    "更多": "More",
+    "设置与工具": "Settings & tools",
     "选择文件夹…": "Choose Folder…",
     "重新扫描": "Rescan",
     "搜索歌手或歌名…": "Search artist or title…",
@@ -29,10 +31,14 @@ _EN: dict[str, str] = {
     "文件尺寸": "Size",
     "序号": "#",
     "点歌": "Queue",
+    "把选中的歌曲加入播放队列": "Add the selected songs to the queue",
     "插入播放": "Insert",
+    "插入到当前歌曲之后播放": "Insert to play after the current song",
     "立即播放": "Play Now",
+    "立刻播放选中的歌曲": "Play the selected song right now",
     "播放": "Play",
     "暂停": "Pause",
+    "播放 / 暂停": "Play / Pause",
     "原唱/伴奏": "Vocal/Karaoke",
     "切换当前歌曲的音轨（原唱/伴奏）": (
         "Switch the current song's audio track (vocal/karaoke)"
@@ -49,10 +55,14 @@ _EN: dict[str, str] = {
         "Phone ordering unavailable (port {port} is in use)"
     ),
     "上移": "Up",
+    "把选中的歌曲在队列中上移一位": "Move the selected song up in the queue",
     "下移": "Down",
+    "把选中的歌曲在队列中下移一位": "Move the selected song down in the queue",
     "删除": "Remove",
+    "从队列中删除选中的歌曲": "Remove the selected song from the queue",
     "红心入队": "Queue ♥",
     "把所有红心歌曲加入队列": "Add every ♥ song to the queue",
+    "播放队列": "Queue",
     "没有红心歌曲": "No ♥ songs yet",
     "红心歌曲都已在队列中": "All ♥ songs are already queued",
     "已加入 {count} 首红心歌曲": "Queued {count} ♥ songs",

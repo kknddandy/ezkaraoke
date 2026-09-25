@@ -66,6 +66,17 @@ QLabel#TimeLabel {
     font-size: 13px;
 }
 
+QLabel#FolderLabel {
+    color: #a0a0b0;
+    font-size: 13px;
+}
+
+QLabel#SectionLabel {
+    color: #a0a0b0;
+    font-size: 13px;
+    font-weight: bold;
+}
+
 /* ===== Buttons ===== */
 QPushButton {
     background-color: #1e1e2f;
@@ -121,6 +132,75 @@ QPushButton#ToolButton {
     font-size: 13px;
 }
 
+/* Overflow "更多" menu button in the select window's top bar */
+QToolButton#MoreButton {
+    background-color: #1e1e2f;
+    color: #ececec;
+    border: 1px solid #2a2a3e;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 13px;
+    min-height: 22px;
+}
+
+QToolButton#MoreButton:hover {
+    background-color: #2a2a3e;
+    border-color: #3a3a52;
+}
+
+QToolButton#MoreButton:pressed {
+    background-color: #151520;
+}
+
+QToolButton#MoreButton::menu-indicator {
+    subcontrol-origin: padding;
+    subcontrol-position: right center;
+    right: 6px;
+}
+
+/* Buttons living inside the overflow menu read as flat, left-aligned rows
+   (they are real QPushButtons wrapped in a QWidgetAction). */
+QMenu QPushButton {
+    text-align: left;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 7px 12px;
+    min-height: 20px;
+    min-width: 168px;
+}
+
+QMenu QPushButton:hover {
+    background-color: rgba(232, 160, 48, 0.25);
+}
+
+QMenu QPushButton:pressed {
+    background-color: rgba(232, 160, 48, 0.35);
+}
+
+QMenu QPushButton:disabled {
+    color: #555566;
+    background: transparent;
+}
+
+/* Thin rule between button groups on an action bar */
+QFrame#Divider {
+    background-color: #2a2a3e;
+    border: none;
+}
+
+/* Uniform sizing for the action / queue control clusters */
+QWidget#ActionBar QPushButton,
+QWidget#QueueBar QPushButton {
+    min-height: 22px;
+    padding: 6px 12px;
+    font-size: 13px;
+}
+
+QWidget#QueueBar QPushButton {
+    padding: 6px 10px;
+}
+
 /* ===== Line Edit ===== */
 QLineEdit {
     background-color: #161622;
@@ -137,6 +217,13 @@ QLineEdit:focus {
 
 QLineEdit::placeholder {
     color: #555566;
+}
+
+/* Prominent search field above the song table */
+QLineEdit#SearchEdit {
+    min-height: 22px;
+    padding: 8px 14px;
+    font-size: 15px;
 }
 
 /* ===== Table Widget ===== */
@@ -246,7 +333,7 @@ QTreeWidget::branch:open:has-children:has-siblings {
 /* ===== List Widget (artist / letter indexes) ===== */
 /* Oversized text + 112px avatar icons: meant to be read from across the room. */
 QListWidget { background-color: #0c0c14; border: 1px solid #1e1e2f; border-radius: 8px; outline: none; font-size: 36px; }
-QListWidget::item { padding: 20px 24px; border-bottom: 1px solid #141420; }
+QListWidget::item { padding: 14px 20px; border-bottom: 1px solid #141420; }
 QListWidget::item:selected { background-color: rgba(232, 160, 48, 0.25); color: #ececec; }
 QListWidget::item:hover { background-color: rgba(232, 160, 48, 0.12); }
 QListWidget::item:disabled { color: #555566; }

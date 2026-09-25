@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -42,8 +43,10 @@ from PySide6.QtWidgets import (
     QTableView,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from ezkaraoke import i18n
@@ -394,13 +397,13 @@ class SelectWindow(QMainWindow):
         # Flexible width (fills the splitter pane, no dead space on wide
         # screens); oversized icons and text for a touch-friendly selection UI.
         self._artist_list = QListWidget(self)
-        self._artist_list.setMinimumWidth(440)
+        self._artist_list.setMinimumWidth(200)
         self._artist_list.setIconSize(QSize(112, 112))
         self._artist_list.itemSelectionChanged.connect(self._on_artist_selection_changed)
         left_layout.addWidget(self._artist_list, stretch=1)
 
         self._letter_list = QListWidget(self)
-        self._letter_list.setMinimumWidth(440)
+        self._letter_list.setMinimumWidth(200)
         self._letter_list.setIconSize(QSize(112, 112))
         self._letter_list.itemSelectionChanged.connect(self._on_letter_selection_changed)
         self._letter_list.hide()
@@ -414,52 +417,75 @@ class SelectWindow(QMainWindow):
         center_layout.setContentsMargins(4, 8, 4, 8)
         center_layout.setSpacing(10)
 
-        # Toolbar row
+        # ---- Top bar: folder path + an overflow "更多" menu ----
+        # The less-frequent configuration actions (folder, rescan, loudness,
+        # mixer, language) hide behind one compact button so the search box
+        # and the song table dominate the screen.
         toolbar = QWidget(self)
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(8)
 
         self._folder_label = QLabel(self)
+        self._folder_label.setObjectName("FolderLabel")
         self._folder_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._update_folder_label()
-        toolbar_layout.addWidget(self._folder_label)
+        toolbar_layout.addWidget(self._folder_label, stretch=1)
 
-        self._btn_choose = QPushButton(tr("选择文件夹…"), self)
+        self._more_menu = QMenu(self)
+        self._btn_more = QToolButton(self)
+        self._btn_more.setObjectName("MoreButton")
+        self._btn_more.setText(tr("更多"))
+        self._btn_more.setToolTip(tr("设置与工具"))
+        self._btn_more.setPopupMode(QToolButton.InstantPopup)
+        self._btn_more.setFixedHeight(36)
+        self._btn_more.setMenu(self._more_menu)
+        toolbar_layout.addWidget(self._btn_more)
+
+        center_layout.addWidget(toolbar)
+
+        # Overflow entries keep their real QPushButton identity (wrapped in a
+        # QWidgetAction) so the existing attributes, slots and enabled states
+        # keep working exactly as before.
+        self._btn_choose = QPushButton(tr("选择文件夹…"), self._more_menu)
         self._btn_choose.setObjectName("ToolButton")
         self._btn_choose.clicked.connect(self._choose_folder)
-        toolbar_layout.addWidget(self._btn_choose)
+        self._add_menu_button(self._more_menu, self._btn_choose)
 
-        self._btn_rescan = QPushButton(tr("重新扫描"), self)
+        self._btn_rescan = QPushButton(tr("重新扫描"), self._more_menu)
         self._btn_rescan.setObjectName("ToolButton")
         self._btn_rescan.clicked.connect(self._start_scan)
-        toolbar_layout.addWidget(self._btn_rescan)
+        self._add_menu_button(self._more_menu, self._btn_rescan)
 
-        self._btn_loudness = QPushButton(tr("响度对齐"), self)
+        self._more_menu.addSeparator()
+
+        self._btn_loudness = QPushButton(tr("响度对齐"), self._more_menu)
         self._btn_loudness.setObjectName("ToolButton")
         self._btn_loudness.clicked.connect(self._open_loudness_panel)
-        toolbar_layout.addWidget(self._btn_loudness)
+        self._add_menu_button(self._more_menu, self._btn_loudness)
 
-        self._btn_mixer = QPushButton(tr("混音台"), self)
+        self._btn_mixer = QPushButton(tr("混音台"), self._more_menu)
         self._btn_mixer.setObjectName("ToolButton")
         self._btn_mixer.clicked.connect(self._open_mixer_panel)
-        toolbar_layout.addWidget(self._btn_mixer)
+        self._add_menu_button(self._more_menu, self._btn_mixer)
 
-        self._btn_lang = QPushButton(self)
+        self._more_menu.addSeparator()
+
+        self._btn_lang = QPushButton(self._more_menu)
         self._btn_lang.setObjectName("ToolButton")
         self._btn_lang.setToolTip("Switch UI language / 切换界面语言")
         self._btn_lang.clicked.connect(self._toggle_language)
         self._update_lang_button()
-        toolbar_layout.addWidget(self._btn_lang)
+        self._add_menu_button(self._more_menu, self._btn_lang)
 
+        # ---- Search: full-width and prominent, right above the table ----
         self._search_edit = QLineEdit(self)
+        self._search_edit.setObjectName("SearchEdit")
         self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
         self._search_edit.setClearButtonEnabled(True)
         self._search_edit.setMinimumWidth(200)
         self._search_edit.textChanged.connect(self._on_search_changed)
-        toolbar_layout.addWidget(self._search_edit)
-
-        center_layout.addWidget(toolbar)
+        center_layout.addWidget(self._search_edit)
 
         # Song table (click 歌手/歌名/文件尺寸 headers to sort; pinyin order
         # for CJK, numeric for size). #SongTable gets the large display font
@@ -479,10 +505,10 @@ class SelectWindow(QMainWindow):
         header.setSectionResizeMode(2, QHeaderView.Interactive)
         header.setSectionResizeMode(3, QHeaderView.Interactive)
         header.setSectionResizeMode(4, QHeaderView.Fixed)
-        self._song_table.setColumnWidth(0, 160)
-        self._song_table.setColumnWidth(2, 120)
-        self._song_table.setColumnWidth(3, 115)
-        self._song_table.setColumnWidth(4, 20)
+        self._song_table.setColumnWidth(0, 110)
+        self._song_table.setColumnWidth(2, 80)
+        self._song_table.setColumnWidth(3, 100)
+        self._song_table.setColumnWidth(4, 16)
         # Comfortable breathing room around the 28px display font
         self._song_table.verticalHeader().setDefaultSectionSize(52)
         # Manual pinyin-aware sorting: Qt's built-in sort compares raw
@@ -510,29 +536,38 @@ class SelectWindow(QMainWindow):
         self._song_table.customContextMenuRequested.connect(self._on_song_context_menu)
         center_layout.addWidget(self._song_table, stretch=1)
 
-        # Action buttons
+        # ---- Action bar: one primary (点歌), secondary queue actions,
+        #      then a separated playback cluster on the right ----
         action_bar = QWidget(self)
+        action_bar.setObjectName("ActionBar")
         action_layout = QHBoxLayout(action_bar)
         action_layout.setContentsMargins(0, 0, 0, 0)
-        action_layout.setSpacing(10)
+        action_layout.setSpacing(8)
 
         self._btn_append = QPushButton(tr("点歌"), self)
         self._btn_append.setObjectName("AccentButton")
+        self._btn_append.setToolTip(tr("把选中的歌曲加入播放队列"))
         self._btn_append.clicked.connect(self._append_selected)
         action_layout.addWidget(self._btn_append)
 
         self._btn_insert = QPushButton(tr("插入播放"), self)
         self._btn_insert.setObjectName("ToolButton")
+        self._btn_insert.setToolTip(tr("插入到当前歌曲之后播放"))
         self._btn_insert.clicked.connect(self._insert_selected)
         action_layout.addWidget(self._btn_insert)
 
         self._btn_play_now = QPushButton(tr("立即播放"), self)
         self._btn_play_now.setObjectName("ToolButton")
+        self._btn_play_now.setToolTip(tr("立刻播放选中的歌曲"))
         self._btn_play_now.clicked.connect(self._play_now_selected)
         action_layout.addWidget(self._btn_play_now)
 
+        action_layout.addStretch()
+        action_layout.addWidget(self._make_divider())
+
         self._btn_play = QPushButton(tr("播放"), self)
         self._btn_play.setObjectName("ToolButton")
+        self._btn_play.setToolTip(tr("播放 / 暂停"))
         self._btn_play.clicked.connect(self._controller.toggle_pause)
         action_layout.addWidget(self._btn_play)
 
@@ -544,7 +579,6 @@ class SelectWindow(QMainWindow):
         self._btn_track.clicked.connect(self._controller.toggle_audio_track)
         action_layout.addWidget(self._btn_track)
 
-        action_layout.addStretch()
         center_layout.addWidget(action_bar)
 
         splitter.addWidget(center_widget)
@@ -571,6 +605,10 @@ class SelectWindow(QMainWindow):
         # Row numbers stay on the vertical header; a separate 序号 column
         # would repeat them. The current song is marked with "▶ " in the
         # title cell. Column 0 is the clickable favorite heart.
+        self._queue_label = QLabel(tr("播放队列"), self)
+        self._queue_label.setObjectName("SectionLabel")
+        right_layout.addWidget(self._queue_label)
+
         self._queue_table = QTableWidget(self)
         self._queue_table.setColumnCount(3)
         self._queue_table.setHorizontalHeaderLabels(["", tr("歌手"), tr("歌名")])
@@ -585,9 +623,10 @@ class SelectWindow(QMainWindow):
         right_layout.addWidget(self._queue_table, stretch=1)
 
         queue_bar = QWidget(self)
+        queue_bar.setObjectName("QueueBar")
         queue_bar_layout = QHBoxLayout(queue_bar)
         queue_bar_layout.setContentsMargins(0, 0, 0, 0)
-        queue_bar_layout.setSpacing(8)
+        queue_bar_layout.setSpacing(6)
 
         self._btn_jump = QPushButton(tr("插歌"), self)
         self._btn_jump.setObjectName("ToolButton")
@@ -597,18 +636,23 @@ class SelectWindow(QMainWindow):
 
         self._btn_up = QPushButton(tr("上移"), self)
         self._btn_up.setObjectName("ToolButton")
+        self._btn_up.setToolTip(tr("把选中的歌曲在队列中上移一位"))
         self._btn_up.clicked.connect(self._move_up)
         queue_bar_layout.addWidget(self._btn_up)
 
         self._btn_down = QPushButton(tr("下移"), self)
         self._btn_down.setObjectName("ToolButton")
+        self._btn_down.setToolTip(tr("把选中的歌曲在队列中下移一位"))
         self._btn_down.clicked.connect(self._move_down)
         queue_bar_layout.addWidget(self._btn_down)
 
         self._btn_remove = QPushButton(tr("删除"), self)
         self._btn_remove.setObjectName("ToolButton")
+        self._btn_remove.setToolTip(tr("从队列中删除选中的歌曲"))
         self._btn_remove.clicked.connect(self._remove_selected)
         queue_bar_layout.addWidget(self._btn_remove)
+
+        queue_bar_layout.addStretch()
 
         self._btn_queue_favs = QPushButton(tr("红心入队"), self)
         self._btn_queue_favs.setObjectName("ToolButton")
@@ -616,13 +660,16 @@ class SelectWindow(QMainWindow):
         self._btn_queue_favs.clicked.connect(self._queue_all_favorites)
         queue_bar_layout.addWidget(self._btn_queue_favs)
 
-        queue_bar_layout.addStretch()
         right_layout.addWidget(queue_bar)
 
         splitter.addWidget(right_widget)
-        # Left pane sized to the oversized list content (~500px on 1920);
-        # the pane can still be dragged wider, the list follows.
-        splitter.setSizes([340, 640, 300])
+        # The song table is the visual focus: give the center pane the
+        # stretch so it absorbs any extra (or missing) horizontal space.
+        # _apply_pane_sizes() rebalances the three panes on every resize.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([300, 700, 300])
 
         # Status bar (left: summary, right: progress + current song)
         self._status_bar = QStatusBar(self)
@@ -671,6 +718,30 @@ class SelectWindow(QMainWindow):
 
     # ===== Language =====
 
+    def _add_menu_button(self, menu: QMenu, button: QPushButton) -> None:
+        """Add *button* to *menu* as a full-width, menu-styled item.
+
+        Wrapping the real button in a QWidgetAction keeps every widget
+        attribute and slot intact while the menu gives the toolbar one tidy
+        entry point for the less-frequent actions.
+        """
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(button)
+        menu.addAction(action)
+        # A widget action does not dismiss the menu by itself, unlike a
+        # regular action; close on click so it behaves like a menu item.
+        button.clicked.connect(menu.close)
+
+    def _make_divider(self) -> QFrame:
+        """Thin vertical rule separating button groups on an action bar."""
+        line = QFrame(self)
+        line.setObjectName("Divider")
+        line.setFrameShape(QFrame.VLine)
+        line.setFrameShadow(QFrame.Plain)
+        line.setFixedWidth(1)
+        line.setFixedHeight(22)
+        return line
+
     def _update_lang_button(self) -> None:
         # The button always offers the *other* language.
         self._btn_lang.setText("EN" if i18n.current_language() == "zh" else "中文")
@@ -686,6 +757,8 @@ class SelectWindow(QMainWindow):
         self.setWindowTitle(tr("ezkaraoke · 点歌台"))
         self._btn_mode_artist.setText(tr("歌手"))
         self._btn_mode_letter.setText(tr("首字母"))
+        self._btn_more.setText(tr("更多"))
+        self._btn_more.setToolTip(tr("设置与工具"))
         self._btn_choose.setText(tr("选择文件夹…"))
         self._btn_rescan.setText(tr("重新扫描"))
         self._btn_loudness.setText(tr("响度对齐"))
@@ -696,16 +769,24 @@ class SelectWindow(QMainWindow):
         self._search_edit.setPlaceholderText(tr("搜索歌手或歌名…"))
         self._song_model.retranslate()
         self._btn_append.setText(tr("点歌"))
+        self._btn_append.setToolTip(tr("把选中的歌曲加入播放队列"))
         self._btn_insert.setText(tr("插入播放"))
+        self._btn_insert.setToolTip(tr("插入到当前歌曲之后播放"))
         self._btn_play_now.setText(tr("立即播放"))
+        self._btn_play_now.setToolTip(tr("立刻播放选中的歌曲"))
         self._btn_play.setText(tr("暂停") if self._controller.is_playing else tr("播放"))
+        self._btn_play.setToolTip(tr("播放 / 暂停"))
         self._btn_track.setText(tr("原唱/伴奏"))
+        self._queue_label.setText(tr("播放队列"))
         self._queue_table.setHorizontalHeaderLabels(["", tr("歌手"), tr("歌名")])
         self._btn_jump.setText(tr("插歌"))
         self._btn_jump.setToolTip(tr("把选中的歌曲移到正在播放歌曲的下一首"))
         self._btn_up.setText(tr("上移"))
+        self._btn_up.setToolTip(tr("把选中的歌曲在队列中上移一位"))
         self._btn_down.setText(tr("下移"))
+        self._btn_down.setToolTip(tr("把选中的歌曲在队列中下移一位"))
         self._btn_remove.setText(tr("删除"))
+        self._btn_remove.setToolTip(tr("从队列中删除选中的歌曲"))
         self._btn_queue_favs.setText(tr("红心入队"))
         self._btn_queue_favs.setToolTip(tr("把所有红心歌曲加入队列"))
         self._qr_title.setText(tr("手机扫码点歌"))
@@ -1724,6 +1805,30 @@ class SelectWindow(QMainWindow):
     def _set_qr_unavailable(self, text: str) -> None:
         self._qr_label.clear()
         self._qr_url.setText(text)
+
+    def _apply_pane_sizes(self) -> None:
+        """Balance the three panes for the current window width.
+
+        The song table is the visual focus, so it always keeps the
+        remaining space; the side panes shrink on narrow windows (1024)
+        and breathe on wide ones (1440+). Called from ``resizeEvent`` so
+        the initial sizing also tracks a later window resize; a manual
+        splitter drag is only overridden when the window itself resizes.
+        """
+        splitter = self.centralWidget()
+        if not isinstance(splitter, QSplitter):
+            return
+        width = splitter.width()
+        if width <= 0:
+            return
+        left = min(360, max(220, int(width * 0.24)))
+        right = min(360, max(300, int(width * 0.21)))
+        center = max(400, width - left - right - 8)
+        splitter.setSizes([left, center, right])
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._apply_pane_sizes()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         # Worker threads are daemons: ask them to stop, but never block the
